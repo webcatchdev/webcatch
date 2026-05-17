@@ -62,7 +62,9 @@ CANCEL_URL = os.getenv("CANCEL_URL", "https://webcatch.dev/")
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.getenv("INSPECTOR_PORT", "9120"))
 HOST = os.getenv("INSPECTOR_HOST", "0.0.0.0")
-ENV = os.getenv("WEBCATCH_ENV", "development")
+
+ENV = os.getenv("WEBCATCH_ENV", "development").strip().lower()
+IS_PRODUCTION = ENV in {"production", "prod"}
 
 # Trial / licensing
 TRIAL_WEBHOOK_LIMIT = int(os.getenv("TRIAL_WEBHOOK_LIMIT", "10"))
@@ -123,11 +125,29 @@ _BLOCKED_NETWORKS = [
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("::ffff:0:0/96"),
     ipaddress.ip_network("0.0.0.0/32"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("ff00::/8"),
 ]
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
+
+def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if IP is in any blocked network or has special properties."""
+    if any(ip in net for net in _BLOCKED_NETWORKS):
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        mapped = ip.ipv4_mapped
+        if any(mapped in net for net in _BLOCKED_NETWORKS):
+            return True
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved:
+        return True
+    return False
 
 
 def _is_safe_url(url: str) -> bool:
@@ -140,22 +160,52 @@ def _is_safe_url(url: str) -> bool:
     hostname = parsed.hostname
     if not hostname:
         return False
-    # Block bare IPs and resolve hostnames
     try:
         ip = ipaddress.ip_address(hostname)
-        if any(ip in net for net in _BLOCKED_NETWORKS):
-            return False
+        return not _ip_is_blocked(ip)
     except ValueError:
-        # It's a hostname — resolve and check
         try:
             resolved = socket.getaddrinfo(hostname, None)
             for _, _, _, _, addr in resolved:
                 ip = ipaddress.ip_address(addr[0])
-                if any(ip in net for net in _BLOCKED_NETWORKS):
+                if _ip_is_blocked(ip):
                     return False
         except socket.gaierror:
             return False
     return True
+
+
+def _resolve_safe_url(url: str) -> tuple[str, dict] | None:
+    """Resolve URL to a safe IP and return (pinned_url, extra_headers). Returns None if unsafe."""
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return None
+    try:
+        ip = ipaddress.ip_address(parsed.hostname)
+        if _ip_is_blocked(ip):
+            return None
+        # Already an IP, no need to pin
+        return url, {}
+    except ValueError:
+        pass
+    # Resolve hostname
+    try:
+        resolved = socket.getaddrinfo(parsed.hostname, None)
+        safe_ips = []
+        for _, _, _, _, addr in resolved:
+            ip = ipaddress.ip_address(addr[0])
+            if _ip_is_blocked(ip):
+                return None
+            safe_ips.append(addr[0])
+        if not safe_ips:
+            return None
+        # Pin to first safe IP, preserve Host header
+        pinned = f"{parsed.scheme}://{safe_ips[0]}:{parsed.port or 80}{parsed.path}"
+        if parsed.query:
+            pinned += f"?{parsed.query}"
+        return pinned, {"Host": parsed.hostname}
+    except socket.gaierror:
+        return None
 
 
 def _check_login_rate_limit(client_ip: str) -> bool:
@@ -171,7 +221,7 @@ def _check_login_rate_limit(client_ip: str) -> bool:
 
 
 # Auth fail-closed: refuse to start in production without a password
-if ENV == "production" and not auth.AUTH_ENABLED:
+if IS_PRODUCTION and not auth.AUTH_ENABLED:
     raise RuntimeError("CRITICAL: WEBCATCH_PASSWORD must be set in production")
 
 
@@ -218,11 +268,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Webcatch", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="Webcatch", version="0.6.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), name="static")
 
 # CORS — only allow same-origin in production; permissive in dev
-origins = ["*"] if ENV == "development" else []
+origins = [] if IS_PRODUCTION else ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -246,6 +296,18 @@ async def security_headers(request: Request, call_next):
         "default-src 'self'; script-src 'self'; style-src 'self';"
     )
     return response
+
+
+@app.middleware("http")
+async def body_size_limit(request: Request, call_next):
+    """Reject requests with body larger than MAX_BODY_SIZE before reading."""
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_BODY_SIZE:
+        return JSONResponse(
+            content={"status": "payload_too_large", "message": f"Max body size is {MAX_BODY_SIZE} bytes"},
+            status_code=413,
+        )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -439,14 +501,16 @@ async def capture_webhook(endpoint_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Invalid endpoint ID")
 
     ep = storage.get_endpoint(endpoint_id)
+    if not ep:
+        return JSONResponse(
+            content={"status": "not_found", "message": "Endpoint does not exist. Create it via POST /api/endpoints first."},
+            status_code=404,
+        )
     if not ep.get("enabled", True):
         return JSONResponse(
             content={"status": "disabled", "message": "This endpoint is currently disabled."},
             status_code=503,
         )
-
-    if endpoint_id not in active_endpoints:
-        active_endpoints[endpoint_id] = {"created": True}
 
     # Rate limit check
     client_ip = request.client.host if request.client else "unknown"
@@ -466,16 +530,22 @@ async def capture_webhook(endpoint_id: str, request: Request):
 
     start_time = time.time()
 
-    # Read body
+    # Read body (with chunked / no Content-Length protection)
     body: Optional[bytes] = None
     try:
-        body = await request.body()
-        if len(body) > MAX_BODY_SIZE:
-            return JSONResponse(
-                content={"status": "payload_too_large", "message": f"Max body size is {MAX_BODY_SIZE} bytes"},
-                status_code=413,
-            )
-        if len(body) == 0:
+        chunks = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > MAX_BODY_SIZE:
+                return JSONResponse(
+                    content={"status": "payload_too_large", "message": f"Max body size is {MAX_BODY_SIZE} bytes"},
+                    status_code=413,
+                )
+            chunks.append(chunk)
+        if chunks:
+            body = b"".join(chunks)
+        if len(body) == 0 if body else True:
             body = None
     except Exception:
         body = None
@@ -779,7 +849,8 @@ async def _forward_webhook(
     for attempt in range(1, max_retries + 1):
         try:
             target = forward_url
-            if not _is_safe_url(target):
+            resolved = _resolve_safe_url(target)
+            if not resolved:
                 storage.update_forward_status(webhook_id, 0, "Forward URL blocked for security")
                 await manager.broadcast({
                     "type": "forward_update",
@@ -787,13 +858,15 @@ async def _forward_webhook(
                     "forward_status": 0,
                 })
                 return
+            pinned_url, extra_headers = resolved
             if query_params:
-                separator = "&" if "?" in forward_url else "?"
-                target += separator + "&".join(f"{k}={v}" for k, v in query_params.items())
+                separator = "&" if "?" in pinned_url else "?"
+                pinned_url += separator + "&".join(f"{k}={v}" for k, v in query_params.items())
             fwd_headers = {k: v for k, v in headers.items() if k.lower() not in ["host", "content-length", "transfer-encoding", "connection"]}
+            fwd_headers.update(extra_headers)
             fwd_body = body
             async with aiohttp.ClientSession(timeout=fwd_timeout) as session:
-                async with session.request(method, target, headers=fwd_headers, data=fwd_body) as resp:
+                async with session.request(method, pinned_url, headers=fwd_headers, data=fwd_body, allow_redirects=False) as resp:
                     resp_text = await resp.text()
                     storage.update_forward_status(webhook_id, resp.status, resp_text[:2000])
                     await manager.broadcast({
@@ -1154,8 +1227,11 @@ async def replay_webhook(webhook_id: str, request: Request):
 
     if method not in _ALLOWED_METHODS:
         raise HTTPException(status_code=400, detail="Method not allowed for replay")
-    if not _is_safe_url(url):
+    resolved = _resolve_safe_url(url)
+    if not resolved:
         raise HTTPException(status_code=400, detail="Target URL not allowed")
+    pinned_url, extra_headers = resolved
+    headers.update(extra_headers)
 
     for h in ["host", "content-length", "transfer-encoding", "connection"]:
         headers.pop(h, None)
@@ -1164,7 +1240,7 @@ async def replay_webhook(webhook_id: str, request: Request):
     try:
         replay_timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=replay_timeout) as session:
-            async with session.request(method, url, headers=headers, data=body.encode("utf-8") if body else None, allow_redirects=False) as resp:
+            async with session.request(method, pinned_url, headers=headers, data=body.encode("utf-8") if body else None, allow_redirects=False) as resp:
                 resp_body = await resp.text()
                 return {
                     "status": "replayed",
@@ -1200,15 +1276,18 @@ async def bulk_replay(request: Request):
         if method not in _ALLOWED_METHODS:
             results.append({"webhook_id": wh_id, "status": "error", "error": "Method not allowed"})
             continue
-        if not _is_safe_url(url):
+        resolved = _resolve_safe_url(url)
+        if not resolved:
             results.append({"webhook_id": wh_id, "status": "error", "error": "Target URL not allowed"})
             continue
+        pinned_url, extra_headers = resolved
+        headers.update(extra_headers)
         for h in ["host", "content-length", "transfer-encoding", "connection"]:
             headers.pop(h, None)
             headers.pop(h.title(), None)
         try:
             async with aiohttp.ClientSession(timeout=replay_timeout) as session:
-                async with session.request(method, url, headers=headers, data=body.encode("utf-8") if body else None, allow_redirects=False) as resp:
+                async with session.request(method, pinned_url, headers=headers, data=body.encode("utf-8") if body else None, allow_redirects=False) as resp:
                     resp_body = await resp.text()
                     results.append({
                         "webhook_id": wh_id,
@@ -1239,8 +1318,11 @@ async def test_webhook(request: Request):
         raise HTTPException(status_code=400, detail="url is required")
     if method not in _ALLOWED_METHODS:
         raise HTTPException(status_code=400, detail="Method not allowed")
-    if not _is_safe_url(target_url):
+    resolved = _resolve_safe_url(target_url)
+    if not resolved:
         raise HTTPException(status_code=400, detail="Target URL not allowed")
+    pinned_url, extra_headers = resolved
+    headers.update(extra_headers)
 
     try:
         req_body = None
@@ -1253,7 +1335,7 @@ async def test_webhook(request: Request):
                 req_body = body.encode('utf-8')
         test_timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=test_timeout) as session:
-            async with session.request(method, target_url, headers=headers, data=req_body, allow_redirects=False) as resp:
+            async with session.request(method, pinned_url, headers=headers, data=req_body, allow_redirects=False) as resp:
                 resp_text = await resp.text()
                 return {
                     "status": "sent",

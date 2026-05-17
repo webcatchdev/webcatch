@@ -1,4 +1,5 @@
 """Basic smoke tests for Webcatch."""
+import asyncio
 import os
 import sys
 import json
@@ -26,7 +27,7 @@ def test_rate_limiter():
     _clean_rate_limiter()
     ip = "1.2.3.4"
     # Should allow first request
-    assert _check_rate_limit(ip) is True
+    assert asyncio.run(_check_rate_limit(ip)) is True
     _clean_rate_limiter()
 
 
