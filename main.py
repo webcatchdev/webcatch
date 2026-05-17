@@ -50,6 +50,9 @@ import license as lic_module
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
 STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+STRIPE_EXPECTED_PRICE_IDS = set(
+    os.getenv("STRIPE_PRICE_IDS", "").strip().split(",")
+) if os.getenv("STRIPE_PRICE_IDS") else set()
 if STRIPE_SECRET_KEY:
     import stripe
     stripe.api_key = STRIPE_SECRET_KEY
@@ -150,6 +153,13 @@ def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return False
 
 
+def _csv_safe(value: str) -> str:
+    """Prefix dangerous CSV characters to prevent formula injection."""
+    if value and value[0] in {"=", "+", "-", "@", "\t", "\r"}:
+        return "'" + value
+    return value
+
+
 def _is_safe_url(url: str) -> bool:
     """Return True if URL is safe for server-side requests (no SSRF)."""
     if not url:
@@ -206,6 +216,21 @@ def _resolve_safe_url(url: str) -> tuple[str, dict] | None:
         return pinned, {"Host": parsed.hostname}
     except socket.gaierror:
         return None
+
+
+_MAX_RESPONSE_TEXT = 256_000  # 256 KB cap on any downstream response body
+
+async def _safe_resp_text(resp) -> str:
+    """Read response text with a hard size ceiling to prevent memory DoS."""
+    chunks = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(8192):
+        total += len(chunk)
+        if total > _MAX_RESPONSE_TEXT:
+            chunks.append(chunk[: (_MAX_RESPONSE_TEXT - (total - len(chunk)))])
+            break
+        chunks.append(chunk)
+    return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 def _check_login_rate_limit(client_ip: str) -> bool:
@@ -593,7 +618,7 @@ async def capture_webhook(endpoint_id: str, request: Request):
                 status_code=402,
             )
 
-    # Store it
+    # Store it (atomic trial check inside storage layer)
     latency_ms = (time.time() - start_time) * 1000
     webhook_id = storage.store_webhook(
         endpoint_id=endpoint_id,
@@ -604,7 +629,13 @@ async def capture_webhook(endpoint_id: str, request: Request):
         query_params=query_params,
         client_ip=client_ip,
         latency_ms=round(latency_ms, 2),
+        trial_limit=TRIAL_WEBHOOK_LIMIT if not _is_licensed() else None,
     )
+    if webhook_id is None:
+        return JSONResponse(
+            content={"status": "trial_expired", "message": f"Trial expired ({TRIAL_WEBHOOK_LIMIT} webhooks). Purchase a license at /api/checkout"},
+            status_code=402,
+        )
 
     # Retention cleanup
     if config and config.get("retention_count"):
@@ -867,14 +898,14 @@ async def _forward_webhook(
             fwd_body = body
             async with aiohttp.ClientSession(timeout=fwd_timeout) as session:
                 async with session.request(method, pinned_url, headers=fwd_headers, data=fwd_body, allow_redirects=False) as resp:
-                    resp_text = await resp.text()
+                    resp_text = await _safe_resp_text(resp)
                     storage.update_forward_status(webhook_id, resp.status, resp_text[:2000])
                     await manager.broadcast({
                         "type": "forward_update",
                         "webhook_id": webhook_id,
                         "forward_status": resp.status,
+                        "forward_response": resp_text[:500],
                     })
-                    return
         except Exception as e:
             if attempt < max_retries:
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
@@ -979,10 +1010,15 @@ async def export_webhooks(format: str = "json", endpoint_id: Optional[str] = Non
         writer.writerow(["id", "endpoint_id", "method", "url", "received_at", "client_ip", "latency_ms", "analysis_time_ms", "body"])
         for wh in webhooks:
             writer.writerow([
-                wh["id"], wh["endpoint_id"], wh["method"], wh["url"],
-                wh["received_at"], wh.get("client_ip", ""),
-                wh.get("latency_ms", ""), wh.get("analysis_time_ms", ""),
-                wh["body"] or "",
+                _csv_safe(wh["id"]),
+                _csv_safe(wh["endpoint_id"]),
+                _csv_safe(wh["method"]),
+                _csv_safe(wh["url"]),
+                _csv_safe(wh["received_at"]),
+                _csv_safe(wh.get("client_ip", "")),
+                _csv_safe(str(wh.get("latency_ms", ""))),
+                _csv_safe(str(wh.get("analysis_time_ms", ""))),
+                _csv_safe(wh["body"] or ""),
             ])
         output.seek(0)
         return StreamingResponse(
@@ -1241,13 +1277,13 @@ async def replay_webhook(webhook_id: str, request: Request):
         replay_timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=replay_timeout) as session:
             async with session.request(method, pinned_url, headers=headers, data=body.encode("utf-8") if body else None, allow_redirects=False) as resp:
-                resp_body = await resp.text()
+                resp_body = await _safe_resp_text(resp)
                 return {
                     "status": "replayed",
                     "original_webhook_id": webhook_id,
                     "target_url": url,
                     "response_status": resp.status,
-                    "response_body": resp_body[:2000],
+                    "response_body": resp_body[:5000],
                 }
     except Exception:
         raise HTTPException(status_code=502, detail="Replay failed")
@@ -1288,16 +1324,16 @@ async def bulk_replay(request: Request):
         try:
             async with aiohttp.ClientSession(timeout=replay_timeout) as session:
                 async with session.request(method, pinned_url, headers=headers, data=body.encode("utf-8") if body else None, allow_redirects=False) as resp:
-                    resp_body = await resp.text()
+                    resp_body = await _safe_resp_text(resp)
                     results.append({
                         "webhook_id": wh_id,
                         "status": "replayed",
                         "target_url": url,
                         "response_status": resp.status,
+                        "response_body": resp_body[:2000],
                     })
         except Exception:
             results.append({"webhook_id": wh_id, "status": "error", "error": "Replay failed"})
-
     return {"replayed": len([r for r in results if r["status"] == "replayed"]), "results": results}
 
 
@@ -1336,7 +1372,7 @@ async def test_webhook(request: Request):
         test_timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=test_timeout) as session:
             async with session.request(method, pinned_url, headers=headers, data=req_body, allow_redirects=False) as resp:
-                resp_text = await resp.text()
+                resp_text = await _safe_resp_text(resp)
                 return {
                     "status": "sent",
                     "target_url": target_url,
@@ -1410,6 +1446,15 @@ async def verify_webhook_sig(webhook_id: str, request: Request):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    # Origin validation: in production, only allow same-origin connections
+    if IS_PRODUCTION:
+        origin = websocket.headers.get("origin", "")
+        host = websocket.headers.get("host", "")
+        if origin and host:
+            origin_host = urlparse(origin).netloc
+            if origin_host != host:
+                await websocket.close(code=1008, reason="Origin mismatch")
+                return
     if auth.AUTH_ENABLED:
         cookie = websocket.cookies.get(auth._COOKIE_NAME, "")
         if not cookie or not auth._verify_cookie_value(cookie):
@@ -1442,7 +1487,7 @@ async def health():
         db_ok = False
     return {
         "status": "ok" if db_ok else "db_error",
-        "version": "0.6.0",
+        "version": "0.6.1",
         "licensed": _is_licensed(),
         "trial_limit": TRIAL_WEBHOOK_LIMIT,
         "trial_used": storage.get_capture_event_count(),
@@ -1554,6 +1599,15 @@ async def stripe_webhook(request: Request):
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         if session.payment_status == "paid":
+            # Verify the session contains an expected price ID (prevents forged webhooks
+            # minting licenses for unrelated Stripe checkouts).
+            line_items = session.get("line_items", {}).get("data", [])
+            price_ids = {item.get("price", {}).get("id", "") for item in line_items}
+            if STRIPE_EXPECTED_PRICE_IDS and not (price_ids & STRIPE_EXPECTED_PRICE_IDS):
+                return JSONResponse(
+                    {"error": "Price ID mismatch", "expected": list(STRIPE_EXPECTED_PRICE_IDS), "got": list(price_ids)},
+                    status_code=400,
+                )
             lic_module.create_license(
                 email=session.customer_details.email if session.customer_details else None,
                 stripe_session_id=session.id

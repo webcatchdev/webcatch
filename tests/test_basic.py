@@ -65,12 +65,17 @@ def test_license_activation():
         try:
             lic_module.init_db()
             key = lic_module.create_license(email="test@example.com")
-            assert lic_module.has_valid_license() is True
+
+            # Before activation, has_valid_license should be False (no activations)
+            assert lic_module.has_valid_license() is False
 
             # First activation should succeed
             result = lic_module.validate_and_activate(key, "1.2.3.4")
             assert result["valid"] is True
             assert result["activations"] == 1
+
+            # After activation, has_valid_license should be True
+            assert lic_module.has_valid_license() is True
 
             # Same IP re-activation should succeed
             result2 = lic_module.validate_and_activate(key, "1.2.3.4")

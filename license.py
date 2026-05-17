@@ -101,10 +101,14 @@ def _get_activation_count(key: str) -> int:
 
 
 def has_valid_license() -> bool:
-    """Return True if any valid license exists in the database."""
+    """Return True if any valid license exists AND has at least one activation."""
     init_db()
     conn = _get_conn()
-    row = conn.execute("SELECT COUNT(*) as c FROM licenses WHERE is_valid = 1").fetchone()
+    # Require at least one activation — prevents someone from manually inserting
+    # a license row and using it without going through the activation flow.
+    row = conn.execute(
+        "SELECT COUNT(*) as c FROM licenses l JOIN license_activations a ON l.key = a.license_key WHERE l.is_valid = 1"
+    ).fetchone()
     conn.close()
     return row["c"] > 0 if row else False
 

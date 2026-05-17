@@ -253,7 +253,10 @@ def store_webhook(
     query_params: dict,
     client_ip: Optional[str],
     latency_ms: Optional[float] = None,
-) -> str:
+    trial_limit: Optional[int] = None,
+) -> str | None:
+    """Store a webhook. If trial_limit is provided, atomically checks against capture_events
+    and returns None if the trial is already exhausted (does NOT increment in that case)."""
     webhook_id = uuid.uuid4().hex[:16]
     headers_json = json.dumps(headers, default=str)
     body_text = body.decode("utf-8", errors="replace") if body else None
@@ -261,18 +264,34 @@ def store_webhook(
     received_at = datetime.now(timezone.utc).isoformat()
 
     conn = _get_conn()
-    conn.execute(
-        """
-        INSERT INTO webhooks (id, endpoint_id, method, url, headers, body, query_params, client_ip, received_at, latency_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (webhook_id, endpoint_id, method, url, headers_json, body_text, query_json, client_ip, received_at, latency_ms),
-    )
-    # Increment capture counter for trial tracking
-    conn.execute("UPDATE capture_events SET count = count + 1 WHERE id = 1")
-    conn.commit()
-    conn.close()
-    return webhook_id
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        # Atomic trial check + increment
+        if trial_limit is not None:
+            row = conn.execute("SELECT count FROM capture_events WHERE id = 1").fetchone()
+            current = row["count"] if row else 0
+            if current >= trial_limit:
+                conn.execute("ROLLBACK")
+                conn.close()
+                return None  # trial exhausted
+
+        conn.execute(
+            """
+            INSERT INTO webhooks (id, endpoint_id, method, url, headers, body, query_params, client_ip, received_at, latency_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (webhook_id, endpoint_id, method, url, headers_json, body_text, query_json, client_ip, received_at, latency_ms),
+        )
+        # Increment capture counter for trial tracking
+        conn.execute("UPDATE capture_events SET count = count + 1 WHERE id = 1")
+        conn.commit()
+        return webhook_id
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
 def apply_retention(endpoint_id: str, retention_count: int) -> None:
