@@ -70,6 +70,10 @@ RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # seconds
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30"))  # requests per window per IP
 _ENDPOINT_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 
+# LLM analysis (disabled by default so high webhook volume doesn't overwhelm small local models)
+ANALYZE_ON_CAPTURE = os.getenv("WEBCATCH_ANALYZE_ON_CAPTURE", "false").lower() in {"1", "true", "yes", "on"}
+LLM_ANALYSIS_CONCURRENCY = int(os.getenv("WEBCATCH_LLM_CONCURRENCY", "1"))
+
 # In-memory rate limiter: {ip: [(timestamp, count), ...]}
 _rate_limiter: dict[str, list] = defaultdict(list)
 
@@ -128,6 +132,7 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+analysis_semaphore = asyncio.Semaphore(LLM_ANALYSIS_CONCURRENCY)
 
 
 @asynccontextmanager
@@ -461,11 +466,13 @@ async def capture_webhook(endpoint_id: str, request: Request):
     if config and config.get("retention_count"):
         storage.apply_retention(endpoint_id, config["retention_count"])
 
-    # Fire-and-forget LLM analysis with timing
+    # Optional fire-and-forget LLM analysis with timing. Disabled by default so
+    # high webhook volume does not overwhelm a small local model.
     body_text = body.decode("utf-8", errors="replace") if body else None
-    asyncio.create_task(
-        _analyze_and_store(webhook_id, request.method, str(request.url), headers, body_text, query_params)
-    )
+    if ANALYZE_ON_CAPTURE:
+        asyncio.create_task(
+            _analyze_and_store(webhook_id, request.method, str(request.url), headers, body_text, query_params)
+        )
 
     # Fire-and-forget schema inference + validation
     if body_text:
@@ -528,7 +535,8 @@ async def _analyze_and_store(
     """Background task: run local LLM analysis and store result."""
     start = time.time()
     try:
-        analysis = await inspector.analyze_webhook(method, url, headers, body, query_params)
+        async with analysis_semaphore:
+            analysis = await inspector.analyze_webhook(method, url, headers, body, query_params)
         elapsed_ms = (time.time() - start) * 1000
         storage.update_analysis(webhook_id, analysis, analysis_time_ms=round(elapsed_ms, 2))
         await manager.broadcast({
@@ -872,6 +880,22 @@ async def get_webhook(webhook_id: str):
     wh["headers"] = json.loads(wh["headers"]) if wh["headers"] else {}
     wh["query_params"] = json.loads(wh["query_params"]) if wh["query_params"] else {}
     return wh
+
+
+@app.post("/api/webhooks/{webhook_id}/analyze")
+async def analyze_webhook_now(webhook_id: str):
+    wh = storage.get_webhook(webhook_id)
+    if not wh:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    headers = json.loads(wh["headers"]) if wh["headers"] else {}
+    query_params = json.loads(wh["query_params"]) if wh["query_params"] else {}
+    await _analyze_and_store(webhook_id, wh["method"], wh["url"], headers, wh["body"], query_params)
+    updated = storage.get_webhook(webhook_id)
+    return {
+        "webhook_id": webhook_id,
+        "analysis": updated.get("analysis") if updated else None,
+        "analysis_time_ms": updated.get("analysis_time_ms") if updated else None,
+    }
 
 
 @app.get("/api/webhooks/{webhook_id}/export")

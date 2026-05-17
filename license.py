@@ -1,4 +1,4 @@
-"""License key management for Webcatch."""
+"""Supporter license key management for Webcatch."""
 import os
 import sqlite3
 import uuid
@@ -28,6 +28,11 @@ def init_db():
         )
     """)
     conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_licenses_stripe_session
+        ON licenses(stripe_session_id)
+        WHERE stripe_session_id IS NOT NULL
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS license_activations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT NOT NULL,
@@ -42,12 +47,31 @@ def init_db():
 
 def create_license(email: str = None, stripe_session_id: str = None) -> str:
     init_db()
-    key = "wc-" + uuid.uuid4().hex[:24]
     conn = _get_conn()
-    conn.execute(
-        "INSERT INTO licenses (key, email, stripe_session_id, created_at) VALUES (?, ?, ?, ?)",
-        (key, email, stripe_session_id, datetime.now(timezone.utc).isoformat())
-    )
+    if stripe_session_id:
+        existing = conn.execute(
+            "SELECT key FROM licenses WHERE stripe_session_id = ?",
+            (stripe_session_id,),
+        ).fetchone()
+        if existing:
+            conn.close()
+            return existing["key"]
+
+    key = "wc-" + uuid.uuid4().hex[:24]
+    try:
+        conn.execute(
+            "INSERT INTO licenses (key, email, stripe_session_id, created_at) VALUES (?, ?, ?, ?)",
+            (key, email, stripe_session_id, datetime.now(timezone.utc).isoformat())
+        )
+    except sqlite3.IntegrityError:
+        existing = conn.execute(
+            "SELECT key FROM licenses WHERE stripe_session_id = ?",
+            (stripe_session_id,),
+        ).fetchone()
+        conn.close()
+        if existing:
+            return existing["key"]
+        raise
     conn.commit()
     conn.close()
     return key

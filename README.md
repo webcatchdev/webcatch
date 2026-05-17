@@ -20,15 +20,25 @@ Most webhook tools send your data to someone else's cloud. Webcatch doesn't. Eve
 
 ## Quick Start
 
-### Docker (recommended)
+### One-liner (Docker)
+
+```bash
+docker run -d \
+  -p 9120:9120 \
+  -v ./data:/app/data \
+  -e WEBCATCH_ANALYZE_ON_CAPTURE=false \
+  ghcr.io/bellum19/webcatch:latest
+```
+
+Open http://localhost:9120
+
+### Docker Compose
 
 ```bash
 git clone https://github.com/webcatchdev/webcatch.git
 cd webcatch
 docker compose up -d
 ```
-
-Open http://localhost:9120
 
 ### Local Python
 
@@ -37,6 +47,51 @@ cd webcatch
 pip install -r requirements.txt
 python main.py
 ```
+
+---
+
+## Local LLM Setup (optional)
+
+Webcatch can analyze webhook payloads with any OpenAI-compatible local model server.
+
+**1. Start a local LLM server.** Examples:
+
+- **llama.cpp** (fast, minimal):
+  ```bash
+  ./server -m your-model.gguf --port 8081
+  ```
+
+- **Ollama** (easy, many models):
+  ```bash
+  ollama run llama3.2
+  # Ollama serves on :11434 by default
+  ```
+
+- **vLLM** (high throughput):
+  ```bash
+  python -m vllm.entrypoints.openai.api_server --model your-model
+  ```
+
+**2. Point Webcatch at it.**
+
+| Setup | `LOCAL_LLM_URL` |
+|-------|-----------------|
+| Native Python | `http://127.0.0.1:8081/v1/chat/completions` |
+| Docker Desktop (Mac/Windows) | `http://host.docker.internal:8081/v1/chat/completions` (default) |
+| Docker (Linux) | `http://<HOST_IP>:8081/v1/chat/completions` or use `--add-host=host.docker.internal:host-gateway` |
+
+**3. Configure behavior in `.env`:**
+
+```bash
+LOCAL_LLM_URL=http://127.0.0.1:8081/v1/chat/completions
+LOCAL_LLM_MODEL=qwen-local
+WEBCATCH_ANALYZE_ON_CAPTURE=false   # true = auto-analyze every webhook
+WEBCATCH_LLM_CONCURRENCY=1          # max concurrent LLM calls
+```
+
+- `WEBCATCH_ANALYZE_ON_CAPTURE=false` (default) — Analysis runs only when you click **Analyze** in the dashboard.
+- `WEBCATCH_ANALYZE_ON_CAPTURE=true` — Every incoming webhook is automatically analyzed.
+- `WEBCATCH_LLM_CONCURRENCY=1` — Protects your local GPU from being overwhelmed.
 
 ---
 
@@ -54,18 +109,24 @@ Your license works on up to 2 devices (contact support to reset activations).
 
 ## Features
 
-- Unlimited endpoints
-- Real-time dashboard
-- Webhook replay & bulk replay
-- Forwarding / proxy with Python transform scripts
-- Signature verification (Stripe, GitHub, Shopify, generic HMAC)
-- Search & filter
-- Webhook diff
-- AI analysis via local LLM
-- Postman / cURL export
-- Schema inference & validation
-- OpenAPI export
-- Custom response codes & headers
+| Feature | Status |
+|---------|--------|
+| Unlimited endpoints | ✅ |
+| Real-time dashboard | ✅ |
+| Webhook replay & bulk replay | ✅ |
+| Forwarding / proxy | ✅ |
+| Custom responses | ✅ |
+| Signature verification | ✅ |
+| Search & filter | ✅ |
+| Webhook diff | ✅ |
+| Local LLM analysis | ✅ |
+| Postman / cURL export | ✅ |
+| Transform scripts | ✅ |
+| Schema inference & validation | ✅ |
+| OpenAPI export | ✅ |
+| Configurable retention | ✅ |
+
+Webcatch is MIT licensed. A $12 lifetime license unlocks unlimited webhooks after the 10-webhook trial.
 
 ---
 
@@ -92,6 +153,8 @@ CANCEL_URL=https://yourdomain.com/
 # Local LLM (optional, for AI analysis)
 LOCAL_LLM_URL=http://127.0.0.1:8081/v1/chat/completions
 LOCAL_LLM_MODEL=qwen-local
+WEBCATCH_ANALYZE_ON_CAPTURE=false
+WEBCATCH_LLM_CONCURRENCY=1
 ```
 
 ---
@@ -134,6 +197,7 @@ Set `WEBCATCH_PASSWORD` to password-protect the dashboard and all API routes. We
 | `/wh/{id}` | ANY | Capture webhooks |
 | `/api/webhooks/{id}/replay` | POST | Replay webhook |
 | `/api/webhooks/{id}/export` | GET | Export single webhook |
+| `/api/webhooks/{id}/analyze` | POST | Analyze webhook with local LLM |
 | `/api/webhooks/{a}/diff/{b}` | GET | Compare webhooks |
 | `/api/checkout` | POST | Create Stripe checkout session ($12) |
 | `/api/license/validate` | POST | Validate license key |
