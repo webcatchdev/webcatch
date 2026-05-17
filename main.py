@@ -512,7 +512,7 @@ async def capture_webhook(endpoint_id: str, request: Request):
 
     # Trial check for capture
     if not _is_licensed():
-        count = storage.get_total_webhook_count()
+        count = storage.get_capture_event_count()
         if count >= TRIAL_WEBHOOK_LIMIT:
             return JSONResponse(
                 content={
