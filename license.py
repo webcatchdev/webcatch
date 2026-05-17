@@ -17,6 +17,7 @@ def _get_conn():
 
 def init_db():
     conn = _get_conn()
+    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             key TEXT PRIMARY KEY,
@@ -40,6 +41,11 @@ def init_db():
             activated_at TEXT NOT NULL,
             FOREIGN KEY (license_key) REFERENCES licenses(key)
         )
+    """)
+    # Add unique constraint to prevent duplicate (key, ip) activations
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_activation
+        ON license_activations(license_key, ip_address)
     """)
     conn.commit()
     conn.close()
@@ -112,33 +118,60 @@ def validate_and_activate(key: str, client_ip: str) -> dict:
     if lic.get("is_valid", 0) != 1:
         return {"valid": False, "activations": 0, "error": "License revoked"}
 
-    current_activations = _get_activation_count(key)
-
-    # Check if this IP already activated (re-activation from same machine is fine)
     conn = _get_conn()
-    existing = conn.execute(
-        "SELECT id FROM license_activations WHERE license_key = ? AND ip_address = ?",
-        (key, client_ip)
-    ).fetchone()
+    try:
+        # Use IMMEDIATE to prevent read-write race conditions
+        conn.execute("BEGIN IMMEDIATE")
 
-    if not existing:
-        if current_activations >= _MAX_ACTIVATIONS:
-            conn.close()
-            return {
-                "valid": False,
-                "activations": current_activations,
-                "error": f"Activation limit reached ({_MAX_ACTIVATIONS} devices). Contact support to reset.",
-            }
+        # Check if this IP already activated (re-activation is fine)
+        existing = conn.execute(
+            "SELECT id FROM license_activations WHERE license_key = ? AND ip_address = ?",
+            (key, client_ip)
+        ).fetchone()
+
+        if not existing:
+            # Count activations under the same transaction
+            row = conn.execute(
+                "SELECT COUNT(*) as c FROM license_activations WHERE license_key = ?",
+                (key,)
+            ).fetchone()
+            current_activations = row["c"] if row else 0
+
+            if current_activations >= _MAX_ACTIVATIONS:
+                conn.execute("ROLLBACK")
+                conn.close()
+                return {
+                    "valid": False,
+                    "activations": current_activations,
+                    "error": f"Activation limit reached ({_MAX_ACTIVATIONS} devices). Contact support to reset.",
+                }
+
+            conn.execute(
+                "INSERT INTO license_activations (license_key, ip_address, activated_at) VALUES (?, ?, ?)",
+                (key, client_ip, datetime.now(timezone.utc).isoformat())
+            )
+            current_activations += 1
+        else:
+            # Already activated from this IP — just count
+            row = conn.execute(
+                "SELECT COUNT(*) as c FROM license_activations WHERE license_key = ?",
+                (key,)
+            ).fetchone()
+            current_activations = row["c"] if row else 0
+
         conn.execute(
-            "INSERT INTO license_activations (license_key, ip_address, activated_at) VALUES (?, ?, ?)",
-            (key, client_ip, datetime.now(timezone.utc).isoformat())
+            "UPDATE licenses SET validated_at = ? WHERE key = ?",
+            (datetime.now(timezone.utc).isoformat(), key)
         )
-        current_activations += 1
-
-    conn.execute(
-        "UPDATE licenses SET validated_at = ? WHERE key = ?",
-        (datetime.now(timezone.utc).isoformat(), key)
-    )
-    conn.commit()
-    conn.close()
-    return {"valid": True, "activations": current_activations, "error": None}
+        conn.commit()
+        conn.close()
+        return {"valid": True, "activations": current_activations, "error": None}
+    except sqlite3.IntegrityError:
+        # Another concurrent activation from same IP won the race
+        conn.execute("ROLLBACK")
+        conn.close()
+        return {"valid": True, "activations": _get_activation_count(key), "error": None}
+    except Exception:
+        conn.execute("ROLLBACK")
+        conn.close()
+        raise

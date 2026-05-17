@@ -50,6 +50,20 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_received ON webhooks(received_at DESC)
         """
     )
+    # Capture counter for trial tracking — never decrements on delete
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS capture_events (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO capture_events (id, count) VALUES (1, 0)
+        """
+    )
     # Migration: add forward columns if missing (old dbs)
     for col in ["forward_status", "forward_response", "forwarded_at"]:
         try:
@@ -254,6 +268,8 @@ def store_webhook(
         """,
         (webhook_id, endpoint_id, method, url, headers_json, body_text, query_json, client_ip, received_at, latency_ms),
     )
+    # Increment capture counter for trial tracking
+    conn.execute("UPDATE capture_events SET count = count + 1 WHERE id = 1")
     conn.commit()
     conn.close()
     return webhook_id
@@ -399,6 +415,14 @@ def get_total_webhook_count() -> int:
     row = conn.execute("SELECT COUNT(*) as c FROM webhooks").fetchone()
     conn.close()
     return row["c"] if row else 0
+
+
+def get_capture_event_count() -> int:
+    """Return total number of capture events ever recorded (never decrements on delete)."""
+    conn = _get_conn()
+    row = conn.execute("SELECT count FROM capture_events WHERE id = 1").fetchone()
+    conn.close()
+    return row["count"] if row else 0
 
 
 def health_check() -> bool:

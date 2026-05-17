@@ -17,6 +17,9 @@ import time
 import csv
 import io
 import re
+import ipaddress
+import socket
+import shlex
 import aiohttp
 import asyncio
 import json
@@ -74,8 +77,17 @@ _ENDPOINT_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 ANALYZE_ON_CAPTURE = os.getenv("WEBCATCH_ANALYZE_ON_CAPTURE", "false").lower() in {"1", "true", "yes", "on"}
 LLM_ANALYSIS_CONCURRENCY = int(os.getenv("WEBCATCH_LLM_CONCURRENCY", "1"))
 
+# Transforms gated by default — exec() sandbox is not secure without RestrictedPython
+ENABLE_TRANSFORMS = os.getenv("WEBCATCH_ENABLE_TRANSFORMS", "false").lower() in {"1", "true", "yes", "on"}
+
 # In-memory rate limiter: {ip: [(timestamp, count), ...]}
 _rate_limiter: dict[str, list] = defaultdict(list)
+_rate_limiter_lock = asyncio.Lock()
+
+# Login rate limiter: {ip: [(timestamp), ...]}
+_login_rate_limiter: dict[str, list] = defaultdict(list)
+_LOGIN_RATE_LIMIT_MAX = 5
+_LOGIN_RATE_LIMIT_WINDOW = 900  # 15 minutes
 
 
 def _clean_rate_limiter():
@@ -88,19 +100,79 @@ def _clean_rate_limiter():
             del _rate_limiter[ip]
 
 
-def _check_rate_limit(client_ip: str) -> bool:
+async def _check_rate_limit(client_ip: str) -> bool:
     """Return True if request is allowed, False if rate limited."""
-    _clean_rate_limiter()
+    async with _rate_limiter_lock:
+        _clean_rate_limiter()
+        now = time.time()
+        entries = _rate_limiter[client_ip]
+        if len(entries) >= RATE_LIMIT_MAX:
+            return False
+        entries.append(now)
+        return True
+
+
+def _validate_endpoint_id(endpoint_id: str) -> bool:
+    return bool(_ENDPOINT_ID_RE.match(endpoint_id))
+
+
+# SSRF protection — block private / loopback / link-local IPs
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("0.0.0.0/32"),
+]
+_ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
+
+def _is_safe_url(url: str) -> bool:
+    """Return True if URL is safe for server-side requests (no SSRF)."""
+    if not url:
+        return False
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    # Block bare IPs and resolve hostnames
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if any(ip in net for net in _BLOCKED_NETWORKS):
+            return False
+    except ValueError:
+        # It's a hostname — resolve and check
+        try:
+            resolved = socket.getaddrinfo(hostname, None)
+            for _, _, _, _, addr in resolved:
+                ip = ipaddress.ip_address(addr[0])
+                if any(ip in net for net in _BLOCKED_NETWORKS):
+                    return False
+        except socket.gaierror:
+            return False
+    return True
+
+
+def _check_login_rate_limit(client_ip: str) -> bool:
+    """Return True if login attempt is allowed."""
     now = time.time()
-    entries = _rate_limiter[client_ip]
-    if len(entries) >= RATE_LIMIT_MAX:
+    cutoff = now - _LOGIN_RATE_LIMIT_WINDOW
+    entries = _login_rate_limiter[client_ip]
+    entries[:] = [t for t in entries if t > cutoff]
+    if len(entries) >= _LOGIN_RATE_LIMIT_MAX:
         return False
     entries.append(now)
     return True
 
 
-def _validate_endpoint_id(endpoint_id: str) -> bool:
-    return bool(_ENDPOINT_ID_RE.match(endpoint_id))
+# Auth fail-closed: refuse to start in production without a password
+if ENV == "production" and not auth.AUTH_ENABLED:
+    raise RuntimeError("CRITICAL: WEBCATCH_PASSWORD must be set in production")
 
 
 # Track active endpoints in memory (endpoint_id → created_at)
@@ -122,7 +194,8 @@ class ConnectionManager:
 
     async def broadcast(self, message: dict):
         disconnected = []
-        for connection in self.active_connections:
+        # Snapshot list to avoid mutation during iteration
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
             except Exception:
@@ -170,7 +243,7 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
+        "default-src 'self'; script-src 'self'; style-src 'self';"
     )
     return response
 
@@ -187,6 +260,7 @@ _AUTH_WHITELIST = {
     "/api/license/validate",
     "/success",
     "/stripe/webhook",
+    "/ws",
 }
 
 LOGIN_HTML = """<!DOCTYPE html>
@@ -271,7 +345,7 @@ def _require_license():
     """Raise 402 if not licensed and trial exhausted."""
     if _is_licensed():
         return
-    count = storage.get_total_webhook_count()
+    count = storage.get_capture_event_count()
     if count < TRIAL_WEBHOOK_LIMIT:
         return
     raise HTTPException(
@@ -351,7 +425,7 @@ async def get_stats():
     stats = storage.get_stats()
     stats["licensed"] = _is_licensed()
     stats["trial_limit"] = TRIAL_WEBHOOK_LIMIT
-    stats["trial_used"] = storage.get_total_webhook_count()
+    stats["trial_used"] = storage.get_capture_event_count()
     return stats
 
 
@@ -376,7 +450,7 @@ async def capture_webhook(endpoint_id: str, request: Request):
 
     # Rate limit check
     client_ip = request.client.host if request.client else "unknown"
-    if not _check_rate_limit(client_ip):
+    if not await _check_rate_limit(client_ip):
         return JSONResponse(
             content={"status": "rate_limited", "message": "Too many requests. Try again later."},
             status_code=429,
@@ -584,12 +658,14 @@ async def _infer_and_validate_schema(endpoint_id: str, webhook_id: str, body_tex
         pass
 
 
-# Thread pool for running user transform scripts
-_transform_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="transform")
+# Thread pool for running user transform scripts (gated by ENABLE_TRANSFORMS)
+_transform_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="transform") if ENABLE_TRANSFORMS else None
 
 
 def _run_transform_sync(script: str, method: str, url: str, headers: dict, body: Optional[str], query: dict) -> tuple:
     """Run a user transform script in a restricted sandbox. Returns (method, url, headers, body, query, error)."""
+    if not ENABLE_TRANSFORMS:
+        return method, url, headers, body, query, "Transforms are disabled"
     if not script or not script.strip():
         return method, url, headers, body, query, None
 
@@ -646,6 +722,14 @@ async def _forward_webhook(
     body_text = body.decode("utf-8", errors="replace") if body else None
 
     if transform_script and transform_script.strip():
+        if not ENABLE_TRANSFORMS:
+            storage.update_forward_status(webhook_id, 0, "Transforms are disabled")
+            await manager.broadcast({
+                "type": "forward_update",
+                "webhook_id": webhook_id,
+                "forward_status": 0,
+            })
+            return
         loop = asyncio.get_event_loop()
         try:
             t_method, t_url, t_headers, t_body, t_query, t_error = await asyncio.wait_for(
@@ -695,6 +779,14 @@ async def _forward_webhook(
     for attempt in range(1, max_retries + 1):
         try:
             target = forward_url
+            if not _is_safe_url(target):
+                storage.update_forward_status(webhook_id, 0, "Forward URL blocked for security")
+                await manager.broadcast({
+                    "type": "forward_update",
+                    "webhook_id": webhook_id,
+                    "forward_status": 0,
+                })
+                return
             if query_params:
                 separator = "&" if "?" in forward_url else "?"
                 target += separator + "&".join(f"{k}={v}" for k, v in query_params.items())
@@ -787,15 +879,13 @@ def _webhook_to_curl(wh: dict) -> str:
     method = wh.get("method", "GET")
     url = wh.get("url", "")
 
-    cmd = f'curl -X {method} "{url}"'
+    cmd = f'curl -X {shlex.quote(method)} {shlex.quote(url)}'
     for k, v in headers.items():
         if k.lower() in ["host", "content-length", "transfer-encoding", "connection"]:
             continue
-        safe_v = str(v).replace('"', '\\"')
-        cmd += f' \\\n  -H "{k}: {safe_v}"'
+        cmd += f' \\n  -H {shlex.quote(f"{k}: {v}")}'
     if body:
-        safe_body = body.replace("'", "'\\''")
-        cmd += f" \\\n  -d '{safe_body}'"
+        cmd += f" \\n  -d {shlex.quote(body)}"
     return cmd
 
 
@@ -864,6 +954,7 @@ async def export_webhooks(format: str = "json", endpoint_id: Optional[str] = Non
 async def list_webhooks(endpoint_id: Optional[str] = None, limit: int = 100):
     if endpoint_id and not _validate_endpoint_id(endpoint_id):
         raise HTTPException(status_code=400, detail="Invalid endpoint ID")
+    limit = min(max(limit, 1), 1000)
 
     webhooks = storage.get_webhooks(endpoint_id=endpoint_id, limit=limit)
     for wh in webhooks:
@@ -1061,6 +1152,11 @@ async def replay_webhook(webhook_id: str, request: Request):
     method = wh["method"]
     url = target_url or wh["url"]
 
+    if method not in _ALLOWED_METHODS:
+        raise HTTPException(status_code=400, detail="Method not allowed for replay")
+    if not _is_safe_url(url):
+        raise HTTPException(status_code=400, detail="Target URL not allowed")
+
     for h in ["host", "content-length", "transfer-encoding", "connection"]:
         headers.pop(h, None)
         headers.pop(h.title(), None)
@@ -1068,7 +1164,7 @@ async def replay_webhook(webhook_id: str, request: Request):
     try:
         replay_timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=replay_timeout) as session:
-            async with session.request(method, url, headers=headers, data=body.encode("utf-8") if body else None) as resp:
+            async with session.request(method, url, headers=headers, data=body.encode("utf-8") if body else None, allow_redirects=False) as resp:
                 resp_body = await resp.text()
                 return {
                     "status": "replayed",
@@ -1077,8 +1173,8 @@ async def replay_webhook(webhook_id: str, request: Request):
                     "response_status": resp.status,
                     "response_body": resp_body[:2000],
                 }
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Replay failed: {e}")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Replay failed")
 
 
 @app.post("/api/bulk-replay")
@@ -1101,12 +1197,18 @@ async def bulk_replay(request: Request):
         body = wh["body"]
         method = wh["method"]
         url = target_url or wh["url"]
+        if method not in _ALLOWED_METHODS:
+            results.append({"webhook_id": wh_id, "status": "error", "error": "Method not allowed"})
+            continue
+        if not _is_safe_url(url):
+            results.append({"webhook_id": wh_id, "status": "error", "error": "Target URL not allowed"})
+            continue
         for h in ["host", "content-length", "transfer-encoding", "connection"]:
             headers.pop(h, None)
             headers.pop(h.title(), None)
         try:
             async with aiohttp.ClientSession(timeout=replay_timeout) as session:
-                async with session.request(method, url, headers=headers, data=body.encode("utf-8") if body else None) as resp:
+                async with session.request(method, url, headers=headers, data=body.encode("utf-8") if body else None, allow_redirects=False) as resp:
                     resp_body = await resp.text()
                     results.append({
                         "webhook_id": wh_id,
@@ -1114,8 +1216,8 @@ async def bulk_replay(request: Request):
                         "target_url": url,
                         "response_status": resp.status,
                     })
-        except Exception as e:
-            results.append({"webhook_id": wh_id, "status": "error", "error": str(e)})
+        except Exception:
+            results.append({"webhook_id": wh_id, "status": "error", "error": "Replay failed"})
 
     return {"replayed": len([r for r in results if r["status"] == "replayed"]), "results": results}
 
@@ -1135,6 +1237,10 @@ async def test_webhook(request: Request):
 
     if not target_url:
         raise HTTPException(status_code=400, detail="url is required")
+    if method not in _ALLOWED_METHODS:
+        raise HTTPException(status_code=400, detail="Method not allowed")
+    if not _is_safe_url(target_url):
+        raise HTTPException(status_code=400, detail="Target URL not allowed")
 
     try:
         req_body = None
@@ -1147,7 +1253,7 @@ async def test_webhook(request: Request):
                 req_body = body.encode('utf-8')
         test_timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=test_timeout) as session:
-            async with session.request(method, target_url, headers=headers, data=req_body) as resp:
+            async with session.request(method, target_url, headers=headers, data=req_body, allow_redirects=False) as resp:
                 resp_text = await resp.text()
                 return {
                     "status": "sent",
@@ -1155,8 +1261,8 @@ async def test_webhook(request: Request):
                     "response_status": resp.status,
                     "response_body": resp_text[:2000],
                 }
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Request failed: {e}")
+    except Exception:
+        raise HTTPException(status_code=502, detail="Request failed")
 
 
 # ---------------------------------------------------------------------------
@@ -1255,15 +1361,17 @@ async def health():
     return {
         "status": "ok" if db_ok else "db_error",
         "version": "0.6.0",
-        "local_llm": inspector.LOCAL_LLM_URL,
         "licensed": _is_licensed(),
         "trial_limit": TRIAL_WEBHOOK_LIMIT,
-        "trial_used": storage.get_total_webhook_count(),
+        "trial_used": storage.get_capture_event_count(),
     }
 
 
 @app.post("/api/login")
 async def api_login(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_login_rate_limit(client_ip):
+        raise HTTPException(status_code=429, detail="Too many login attempts. Try again later.")
     data = await request.json()
     password = data.get("password", "")
     return auth.login_response(password)

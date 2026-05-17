@@ -88,29 +88,31 @@ def _is_secure() -> bool:
 def login_response(password: str) -> Optional[JSONResponse]:
     if not AUTH_ENABLED:
         return JSONResponse({"status": "ok", "message": "Auth not configured"})
-    if password == AUTH_PASSWORD:
-        resp = JSONResponse({"status": "ok", "authenticated": True, "csrf_token": generate_csrf_token()})
-        secure = _is_secure()
-        resp.set_cookie(
-            _COOKIE_NAME,
-            _make_cookie_value(),
-            max_age=_COOKIE_MAX_AGE,
-            httponly=True,
-            samesite="strict" if secure else "lax",
-            secure=secure,
-        )
-        # Set CSRF cookie for state-changing requests
-        csrf = generate_csrf_token()
-        resp.set_cookie(
-            _CSRF_COOKIE,
-            csrf,
-            max_age=_COOKIE_MAX_AGE,
-            httponly=False,
-            samesite="strict" if secure else "lax",
-            secure=secure,
-        )
-        return resp
-    return JSONResponse({"status": "error", "message": "Invalid password"}, status_code=403)
+    # Constant-time comparison to prevent timing attacks
+    if not hmac.compare_digest(password.encode(), AUTH_PASSWORD.encode()):
+        return JSONResponse({"status": "error", "message": "Invalid password"}, status_code=403)
+    
+    # Generate ONE CSRF token, use it for both JSON body and cookie
+    csrf = generate_csrf_token()
+    resp = JSONResponse({"status": "ok", "authenticated": True, "csrf_token": csrf})
+    secure = _is_secure()
+    resp.set_cookie(
+        _COOKIE_NAME,
+        _make_cookie_value(),
+        max_age=_COOKIE_MAX_AGE,
+        httponly=True,
+        samesite="strict" if secure else "lax",
+        secure=secure,
+    )
+    resp.set_cookie(
+        _CSRF_COOKIE,
+        csrf,
+        max_age=_COOKIE_MAX_AGE,
+        httponly=False,
+        samesite="strict" if secure else "lax",
+        secure=secure,
+    )
+    return resp
 
 
 def logout_response() -> JSONResponse:
