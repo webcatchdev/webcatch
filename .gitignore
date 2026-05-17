@@ -6,3 +6,5 @@ __pycache__/
 data/
 .venv/
 venv/
+
+.hermes_*
