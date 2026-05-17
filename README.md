@@ -23,7 +23,7 @@ Most webhook tools send your data to someone else's cloud. Webcatch doesn't. Eve
 ### Docker (recommended)
 
 ```bash
-git clone https://github.com/bellum19/webcatch.git
+git clone https://github.com/webcatchdev/webcatch.git
 cd webcatch
 docker compose up -d
 ```
@@ -40,26 +40,32 @@ python main.py
 
 ---
 
+## Pricing
+
+Webcatch is a **$12 one-time purchase**. No subscriptions. No recurring fees.
+
+**Trial:** Capture up to 10 webhooks for free. After that, enter a license key to unlock unlimited usage.
+
+[Purchase a license](https://webcatch.dev) → receive a license key → paste it into Settings → License.
+
+Your license works on up to 2 devices (contact support to reset activations).
+
+---
+
 ## Features
 
-| Feature | Free | Pro |
-|---------|------|-----|
-| Unlimited endpoints | ✅ | ✅ |
-| Real-time dashboard | ✅ | ✅ |
-| Webhook replay | ✅ | ✅ |
-| Forwarding / proxy | ✅ | ✅ |
-| Signature verification | ✅ | ✅ |
-| Search & filter | ✅ | ✅ |
-| Webhook diff | ✅ | ✅ |
-| AI analysis | ✅ | ✅ |
-| **Postman / cURL export** | ✅ | ✅ |
-| **Transform scripts** | ✅ | ✅ |
-| **Schema inference & validation** | ✅ | ✅ |
-| Unlimited history | 100 recent | Unlimited |
-| Team sharing | ❌ | Up to 5 users |
-| Custom responses | ❌ | ✅ |
-| Bulk replay | ❌ | ✅ |
-| Priority support | ❌ | ✅ |
+- Unlimited endpoints
+- Real-time dashboard
+- Webhook replay & bulk replay
+- Forwarding / proxy with Python transform scripts
+- Signature verification (Stripe, GitHub, Shopify, generic HMAC)
+- Search & filter
+- Webhook diff
+- AI analysis via local LLM
+- Postman / cURL export
+- Schema inference & validation
+- OpenAPI export
+- Custom response codes & headers
 
 ---
 
@@ -71,14 +77,15 @@ Create a `.env` file:
 # App
 INSPECTOR_PORT=9120
 INSPECTOR_HOST=0.0.0.0
+WEBCATCH_ENV=production
 
 # Auth (optional — protects dashboard & API, leaves webhook capture open)
 WEBCATCH_PASSWORD=your-secure-password
 
-# Stripe (optional, for Pro license sales)
-STRIPE_SECRET_KEY=***
+# Stripe (for $12 license checkout)
+STRIPE_SECRET_KEY=sk_...
 STRIPE_PUBLISHABLE_KEY=pk_...
-STRIPE_WEBHOOK_SECRET=***
+STRIPE_WEBHOOK_SECRET=whsec_...
 SUCCESS_URL=https://yourdomain.com/success?session_id={CHECKOUT_SESSION_ID}
 CANCEL_URL=https://yourdomain.com/
 
@@ -120,14 +127,16 @@ Set `WEBCATCH_PASSWORD` to password-protect the dashboard and all API routes. We
 | `/api/webhooks/export?format=postman` | GET | Export as Postman collection |
 | `/api/webhooks/export?format=curl` | GET | Export as cURL script |
 | `/api/webhooks/export?format=csv` | GET | Export as CSV |
-| `/api/endpoints/{id}/config` | GET/PUT | Get/set endpoint config (forward URL, transforms, filters, custom responses) |
-| `/api/endpoints/{id}/schema` | GET | Get inferred JSON schema for endpoint |
-| `/api/endpoints/{id}/schema/infer` | POST | Force re-inference of schema |
-| `/api/endpoints/{id}/schema/openapi` | GET | Export inferred schema as OpenAPI document |
+| `/api/endpoints/{id}/config` | GET/PUT | Get/set endpoint config |
+| `/api/endpoints/{id}/schema` | GET | Get inferred JSON schema |
+| `/api/endpoints/{id}/schema/infer` | POST | Force re-inference |
+| `/api/endpoints/{id}/schema/openapi` | GET | Export as OpenAPI document |
 | `/wh/{id}` | ANY | Capture webhooks |
 | `/api/webhooks/{id}/replay` | POST | Replay webhook |
 | `/api/webhooks/{id}/export` | GET | Export single webhook |
 | `/api/webhooks/{a}/diff/{b}` | GET | Compare webhooks |
+| `/api/checkout` | POST | Create Stripe checkout session ($12) |
+| `/api/license/validate` | POST | Validate license key |
 | `/ws` | WebSocket | Live updates |
 
 Full API docs at `/docs` when running.

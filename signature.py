@@ -6,13 +6,13 @@ Supports: Stripe, GitHub, Shopify, generic HMAC-SHA256.
 import hashlib
 import hmac
 import json
+import time
 from typing import Optional
 
 
 def verify_stripe(payload: bytes, signature: str, secret: str) -> bool:
-    """Verify Stripe webhook signature."""
+    """Verify Stripe webhook signature with timestamp tolerance."""
     try:
-        # Signature format: t=<timestamp>,v1=<sig>[,v1=<sig>...]
         elements = signature.split(",")
         sig_dict = {}
         for elem in elements:
@@ -21,6 +21,12 @@ def verify_stripe(payload: bytes, signature: str, secret: str) -> bool:
                 sig_dict.setdefault(k, []).append(v)
 
         timestamp = sig_dict.get("t", [""])[0]
+        if not timestamp:
+            return False
+        # Reject signatures older than 5 minutes (replay protection)
+        if abs(int(time.time()) - int(timestamp)) > 300:
+            return False
+
         expected = hmac.new(
             secret.encode("utf-8"),
             f"{timestamp}.".encode("utf-8") + payload,

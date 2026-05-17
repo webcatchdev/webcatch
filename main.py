@@ -1,58 +1,110 @@
 #!/usr/bin/env python3
 """
-Webhook Inspector — Self-hosted, privacy-first webhook capture and analysis.
+Webcatch 🔍 — Self-hosted webhook capture, replay, and analysis.
 
 Run:
     uvicorn main:app --host 0.0.0.0 --port 9120 --reload
 
 Environment:
-    LOCAL_LLM_URL   → local model endpoint (default: http://127.0.0.1:8081/v1/chat/completions)
-    LOCAL_LLM_MODEL → model name (default: qwen-local)
-    INSPECTOR_PORT  → port to run on (default: 9120)
+    LOCAL_LLM_URL     → local model endpoint (default: http://127.0.0.1:8081/v1/chat/completions)
+    LOCAL_LLM_MODEL   → model name (default: qwen-local)
+    INSPECTOR_PORT    → port (default: 9120)
+    WEBCATCH_PASSWORD → optional dashboard password
+    STRIPE_SECRET_KEY → Stripe secret key for $12 license checkout
 """
 
 import time
 import csv
 import io
+import re
 import aiohttp
 import asyncio
 import json
 import os
 import concurrent.futures
+import hashlib
+import hmac
+import secrets as _secrets
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse, parse_qs
 
 from fastapi import FastAPI, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
 import storage
 import inspector
 import schema_engine
 import auth
-
-
-import stripe
-import license
+import signature as sig_module
+import license as lic_module
 
 # Stripe config
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-stripe.api_key = STRIPE_SECRET_KEY
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "").strip()
+STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "").strip()
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+if STRIPE_SECRET_KEY:
+    import stripe
+    stripe.api_key = STRIPE_SECRET_KEY
+else:
+    stripe = None
+
 SUCCESS_URL = os.getenv("SUCCESS_URL", "https://webcatch.dev/success?session_id={CHECKOUT_SESSION_ID}")
 CANCEL_URL = os.getenv("CANCEL_URL", "https://webcatch.dev/")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.getenv("INSPECTOR_PORT", "9120"))
 HOST = os.getenv("INSPECTOR_HOST", "0.0.0.0")
+ENV = os.getenv("WEBCATCH_ENV", "development")
+
+# Trial / licensing
+TRIAL_WEBHOOK_LIMIT = int(os.getenv("TRIAL_WEBHOOK_LIMIT", "10"))
+
+# Security constants
+MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", "1048576"))  # 1MB
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))  # seconds
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30"))  # requests per window per IP
+_ENDPOINT_ID_RE = re.compile(r"^[a-f0-9]{12}$")
+
+# In-memory rate limiter: {ip: [(timestamp, count), ...]}
+_rate_limiter: dict[str, list] = defaultdict(list)
+
+
+def _clean_rate_limiter():
+    """Remove expired rate limit entries."""
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW
+    for ip in list(_rate_limiter.keys()):
+        _rate_limiter[ip] = [t for t in _rate_limiter[ip] if t > cutoff]
+        if not _rate_limiter[ip]:
+            del _rate_limiter[ip]
+
+
+def _check_rate_limit(client_ip: str) -> bool:
+    """Return True if request is allowed, False if rate limited."""
+    _clean_rate_limiter()
+    now = time.time()
+    entries = _rate_limiter[client_ip]
+    if len(entries) >= RATE_LIMIT_MAX:
+        return False
+    entries.append(now)
+    return True
+
+
+def _validate_endpoint_id(endpoint_id: str) -> bool:
+    return bool(_ENDPOINT_ID_RE.match(endpoint_id))
+
 
 # Track active endpoints in memory (endpoint_id → created_at)
 active_endpoints: dict[str, str] = {}
 
-# WebSocket connection manager
+
 class ConnectionManager:
+    """WebSocket connection manager for real-time dashboard updates."""
     def __init__(self):
         self.active_connections: list[WebSocket] = []
 
@@ -82,17 +134,46 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
     storage.init_db()
     storage.init_endpoint_config()
-    # Restore endpoint IDs from DB
+    lic_module.init_db()
     for eid in storage.get_all_endpoint_ids():
         active_endpoints[eid] = {"created": True}
     yield
-    # cleanup if needed
 
 
-app = FastAPI(title="Webhook Inspector", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="Webcatch", version="0.6.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), name="static")
 
-# Auth middleware: protect everything except webhook capture and whitelisted public routes
+# CORS — only allow same-origin in production; permissive in dev
+origins = ["*"] if ENV == "development" else []
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
+    )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Auth & license middleware
+# ---------------------------------------------------------------------------
+
 _AUTH_WHITELIST = {
     "/api/health",
     "/api/login",
@@ -163,7 +244,35 @@ async def auth_middleware(request: Request, call_next):
         if "text/html" in accept:
             return HTMLResponse(LOGIN_HTML, status_code=401)
         return JSONResponse({"error": "Authentication required"}, status_code=401)
+    # CSRF check for state-changing methods (POST/PUT/DELETE/PATCH)
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        try:
+            auth.require_csrf(request)
+        except HTTPException:
+            return JSONResponse({"error": "CSRF token invalid"}, status_code=403)
     return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# License helpers
+# ---------------------------------------------------------------------------
+
+def _is_licensed() -> bool:
+    """Check if app has a valid license (caches briefly in memory)."""
+    return lic_module.has_valid_license()
+
+
+def _require_license():
+    """Raise 402 if not licensed and trial exhausted."""
+    if _is_licensed():
+        return
+    count = storage.get_total_webhook_count()
+    if count < TRIAL_WEBHOOK_LIMIT:
+        return
+    raise HTTPException(
+        status_code=402,
+        detail=f"Trial expired ({TRIAL_WEBHOOK_LIMIT} webhooks). Purchase a license at /api/checkout",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +285,8 @@ async def dashboard_root():
     if os.path.exists(html_path):
         with open(html_path, "r", encoding="utf-8") as f:
             return f.read()
-    return "<h1>Webhook Inspector</h1><p>Dashboard HTML not found.</p>"
+    return "<h1>Webcatch</h1><p>Dashboard HTML not found.</p>"
+
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
@@ -184,7 +294,7 @@ async def dashboard():
     if os.path.exists(html_path):
         with open(html_path, "r", encoding="utf-8") as f:
             return f.read()
-    return "<h1>Webhook Inspector</h1><p>Dashboard HTML not found.</p>"
+    return "<h1>Webcatch</h1><p>Dashboard HTML not found.</p>"
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +303,7 @@ async def dashboard():
 
 @app.post("/api/endpoints")
 async def create_endpoint():
+    _require_license()
     endpoint_id = storage.create_endpoint()
     active_endpoints[endpoint_id] = {"created": True}
     return {
@@ -217,6 +328,9 @@ async def list_endpoints():
 
 @app.post("/api/endpoints/{endpoint_id}/toggle")
 async def toggle_endpoint(endpoint_id: str):
+    _require_license()
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     ep = storage.get_endpoint(endpoint_id)
     new_state = not ep.get("enabled", True)
     storage.set_endpoint_enabled(endpoint_id, new_state)
@@ -229,7 +343,11 @@ async def toggle_endpoint(endpoint_id: str):
 
 @app.get("/api/stats")
 async def get_stats():
-    return storage.get_stats()
+    stats = storage.get_stats()
+    stats["licensed"] = _is_licensed()
+    stats["trial_limit"] = TRIAL_WEBHOOK_LIMIT
+    stats["trial_used"] = storage.get_total_webhook_count()
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +356,9 @@ async def get_stats():
 
 @app.api_route("/wh/{endpoint_id}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def capture_webhook(endpoint_id: str, request: Request):
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
+
     ep = storage.get_endpoint(endpoint_id)
     if not ep.get("enabled", True):
         return JSONResponse(
@@ -248,12 +369,33 @@ async def capture_webhook(endpoint_id: str, request: Request):
     if endpoint_id not in active_endpoints:
         active_endpoints[endpoint_id] = {"created": True}
 
+    # Rate limit check
+    client_ip = request.client.host if request.client else "unknown"
+    if not _check_rate_limit(client_ip):
+        return JSONResponse(
+            content={"status": "rate_limited", "message": "Too many requests. Try again later."},
+            status_code=429,
+        )
+
+    # Body size check
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_BODY_SIZE:
+        return JSONResponse(
+            content={"status": "payload_too_large", "message": f"Max body size is {MAX_BODY_SIZE} bytes"},
+            status_code=413,
+        )
+
     start_time = time.time()
 
     # Read body
     body: Optional[bytes] = None
     try:
         body = await request.body()
+        if len(body) > MAX_BODY_SIZE:
+            return JSONResponse(
+                content={"status": "payload_too_large", "message": f"Max body size is {MAX_BODY_SIZE} bytes"},
+                status_code=413,
+            )
         if len(body) == 0:
             body = None
     except Exception:
@@ -265,35 +407,42 @@ async def capture_webhook(endpoint_id: str, request: Request):
     # Query params
     query_params = dict(request.query_params)
 
-    # Client IP
-    client_ip = request.client.host if request.client else None
-
     # Filter rules check
     config = storage.get_endpoint_config(endpoint_id)
     if config:
         rules = config.get("filter_rules") or {}
         if rules:
-            # Method filter
             allowed_methods = rules.get("allowed_methods")
             if allowed_methods and request.method not in allowed_methods:
                 return JSONResponse(
                     content={"status": "filtered", "reason": "method_not_allowed"},
-                    status_code=200,
+                    status_code=202,
                 )
-            # Header required filter
             required_header = rules.get("required_header")
             if required_header:
                 key, val = required_header.split(":", 1) if ":" in required_header else (required_header, None)
                 if key not in headers:
-                    return JSONResponse(content={"status": "filtered", "reason": "missing_header"}, status_code=200)
+                    return JSONResponse(content={"status": "filtered", "reason": "missing_header"}, status_code=202)
                 if val and headers.get(key) != val:
-                    return JSONResponse(content={"status": "filtered", "reason": "header_mismatch"}, status_code=200)
-            # Body contains filter
+                    return JSONResponse(content={"status": "filtered", "reason": "header_mismatch"}, status_code=202)
             body_contains = rules.get("body_contains")
             if body_contains:
                 body_text = body.decode("utf-8", errors="replace") if body else ""
                 if body_contains not in body_text:
-                    return JSONResponse(content={"status": "filtered", "reason": "body_no_match"}, status_code=200)
+                    return JSONResponse(content={"status": "filtered", "reason": "body_no_match"}, status_code=202)
+
+    # Trial check for capture
+    if not _is_licensed():
+        count = storage.get_total_webhook_count()
+        if count >= TRIAL_WEBHOOK_LIMIT:
+            return JSONResponse(
+                content={
+                    "status": "trial_expired",
+                    "message": f"Trial limit reached ({TRIAL_WEBHOOK_LIMIT} webhooks). Purchase at /api/checkout",
+                    "checkout_url": "/api/checkout",
+                },
+                status_code=402,
+            )
 
     # Store it
     latency_ms = (time.time() - start_time) * 1000
@@ -362,7 +511,6 @@ async def capture_webhook(endpoint_id: str, request: Request):
             headers=resp_headers,
         )
 
-    # Return a generic 200 so the sender doesn't error out
     return JSONResponse(
         content={"status": "captured", "webhook_id": webhook_id},
         status_code=200,
@@ -383,7 +531,6 @@ async def _analyze_and_store(
         analysis = await inspector.analyze_webhook(method, url, headers, body, query_params)
         elapsed_ms = (time.time() - start) * 1000
         storage.update_analysis(webhook_id, analysis, analysis_time_ms=round(elapsed_ms, 2))
-        # Broadcast analysis update
         await manager.broadcast({
             "type": "analysis_update",
             "webhook_id": webhook_id,
@@ -404,13 +551,11 @@ async def _analyze_and_store(
 async def _infer_and_validate_schema(endpoint_id: str, webhook_id: str, body_text: str) -> None:
     """Background task: infer schema from all webhooks for endpoint, validate this webhook."""
     try:
-        # Get existing schema
         existing = storage.get_schema(endpoint_id)
         schema = None
         if existing:
             schema = json.loads(existing["schema_json"])
 
-        # Validate current webhook against existing schema
         validation_errors = []
         if schema:
             validation_errors = schema_engine.validate_body(body_text, schema)
@@ -422,14 +567,12 @@ async def _infer_and_validate_schema(endpoint_id: str, webhook_id: str, body_tex
                     "validation_errors": validation_errors,
                 })
 
-        # Re-infer schema from recent webhooks for this endpoint
         recent = storage.get_webhooks(endpoint_id, limit=200)
         bodies = [wh["body"] for wh in recent if wh.get("body")]
         new_schema = schema_engine.infer_schema(bodies)
         if new_schema:
             storage.set_schema(endpoint_id, new_schema, len(bodies))
     except Exception:
-        # Schema inference should never break the capture flow
         pass
 
 
@@ -442,6 +585,7 @@ def _run_transform_sync(script: str, method: str, url: str, headers: dict, body:
     if not script or not script.strip():
         return method, url, headers, body, query, None
 
+    # Restricted builtins — NO type, isinstance, hasattr, getattr to prevent sandbox escape
     safe_globals = {
         "__builtins__": {
             "len": len, "str": str, "int": int, "float": float,
@@ -450,7 +594,6 @@ def _run_transform_sync(script: str, method: str, url: str, headers: dict, body:
             "re": __import__("re"),
             "datetime": __import__("datetime"),
             "print": lambda *a, **k: None,
-            "type": type, "isinstance": isinstance, "hasattr": hasattr, "getattr": getattr,
             "enumerate": enumerate, "range": range, "zip": zip, "map": map, "filter": filter,
             "sum": sum, "min": min, "max": max, "abs": abs, "round": round,
         }
@@ -490,11 +633,10 @@ async def _forward_webhook(
     """Forward captured webhook to another URL with retry and optional transform."""
     max_retries = 3
     base_delay = 1.0
+    fwd_timeout = aiohttp.ClientTimeout(total=30)
 
-    # Decode body for transform
     body_text = body.decode("utf-8", errors="replace") if body else None
 
-    # Run transform if configured
     if transform_script and transform_script.strip():
         loop = asyncio.get_event_loop()
         try:
@@ -550,7 +692,7 @@ async def _forward_webhook(
                 target += separator + "&".join(f"{k}={v}" for k, v in query_params.items())
             fwd_headers = {k: v for k, v in headers.items() if k.lower() not in ["host", "content-length", "transfer-encoding", "connection"]}
             fwd_body = body
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=fwd_timeout) as session:
                 async with session.request(method, target, headers=fwd_headers, data=fwd_body) as resp:
                     resp_text = await resp.text()
                     storage.update_forward_status(webhook_id, resp.status, resp_text[:2000])
@@ -559,12 +701,11 @@ async def _forward_webhook(
                         "webhook_id": webhook_id,
                         "forward_status": resp.status,
                     })
-                    return  # success
+                    return
         except Exception as e:
             if attempt < max_retries:
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
                 continue
-            # final attempt failed
             storage.update_forward_status(webhook_id, 0, str(e)[:500])
             await manager.broadcast({
                 "type": "forward_update",
@@ -573,40 +714,8 @@ async def _forward_webhook(
             })
 
 
-async def _analyze_and_store(
-    webhook_id: str,
-    method: str,
-    url: str,
-    headers: dict,
-    body: Optional[str],
-    query_params: dict,
-) -> None:
-    """Background task: run local LLM analysis and store result."""
-    start = time.time()
-    try:
-        analysis = await inspector.analyze_webhook(method, url, headers, body, query_params)
-        elapsed_ms = (time.time() - start) * 1000
-        storage.update_analysis(webhook_id, analysis, analysis_time_ms=round(elapsed_ms, 2))
-        # Broadcast analysis update
-        await manager.broadcast({
-            "type": "analysis_update",
-            "webhook_id": webhook_id,
-            "analysis": analysis,
-            "analysis_time_ms": round(elapsed_ms, 2),
-        })
-    except Exception as e:
-        elapsed_ms = (time.time() - start) * 1000
-        storage.update_analysis(webhook_id, f"Analysis failed: {e}", analysis_time_ms=round(elapsed_ms, 2))
-        await manager.broadcast({
-            "type": "analysis_update",
-            "webhook_id": webhook_id,
-            "analysis": f"Analysis failed: {e}",
-            "analysis_time_ms": round(elapsed_ms, 2),
-        })
-
-
 # ---------------------------------------------------------------------------
-# API: Export webhooks (must be before /api/webhooks/{webhook_id})
+# API: Export webhooks
 # ---------------------------------------------------------------------------
 
 def _webhook_to_postman_item(wh: dict) -> dict:
@@ -616,11 +725,9 @@ def _webhook_to_postman_item(wh: dict) -> dict:
     body = wh.get("body")
     method = wh.get("method", "GET")
     url = wh.get("url", "")
-    
-    # Build URL object
+
     url_obj = {"raw": url, "host": [url]}
     try:
-        from urllib.parse import urlparse, parse_qs
         parsed = urlparse(url)
         url_obj = {
             "raw": url,
@@ -632,15 +739,13 @@ def _webhook_to_postman_item(wh: dict) -> dict:
         }
     except Exception:
         pass
-    
-    # Build header list (skip hop-by-hop)
+
     header_list = []
     for k, v in headers.items():
         if k.lower() in ["host", "content-length", "transfer-encoding", "connection"]:
             continue
         header_list.append({"key": k, "value": str(v)})
-    
-    # Build body
+
     body_obj = None
     if body:
         content_type = headers.get("content-type", headers.get("Content-Type", ""))
@@ -651,7 +756,7 @@ def _webhook_to_postman_item(wh: dict) -> dict:
                 body_obj = {"mode": "raw", "raw": body}
         else:
             body_obj = {"mode": "raw", "raw": body}
-    
+
     item = {
         "name": f"{method} {url[:80]}",
         "request": {
@@ -673,7 +778,7 @@ def _webhook_to_curl(wh: dict) -> str:
     body = wh.get("body")
     method = wh.get("method", "GET")
     url = wh.get("url", "")
-    
+
     cmd = f'curl -X {method} "{url}"'
     for k, v in headers.items():
         if k.lower() in ["host", "content-length", "transfer-encoding", "connection"]:
@@ -688,6 +793,10 @@ def _webhook_to_curl(wh: dict) -> str:
 
 @app.get("/api/webhooks/export")
 async def export_webhooks(format: str = "json", endpoint_id: Optional[str] = None):
+    _require_license()
+    if endpoint_id and not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
+
     webhooks = storage.get_webhooks(endpoint_id=endpoint_id, limit=1000)
     for wh in webhooks:
         wh["headers"] = json.loads(wh["headers"]) if wh["headers"] else {}
@@ -708,9 +817,9 @@ async def export_webhooks(format: str = "json", endpoint_id: Optional[str] = Non
         return StreamingResponse(
             io.BytesIO(output.getvalue().encode("utf-8")),
             media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=webhooks-{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"},
+            headers={"Content-Disposition": f"attachment; filename=webcatch-{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv"},
         )
-    
+
     if format == "postman":
         collection = {
             "info": {
@@ -726,7 +835,7 @@ async def export_webhooks(format: str = "json", endpoint_id: Optional[str] = Non
             media_type="application/json",
             headers={"Content-Disposition": f"attachment; filename=webcatch-{endpoint_id or 'all'}-{datetime.now(timezone.utc).strftime('%Y%m%d')}.postman_collection.json"},
         )
-    
+
     if format == "curl":
         commands = [_webhook_to_curl(wh) for wh in webhooks]
         output = "\n\n# ----\n\n".join(commands)
@@ -745,8 +854,10 @@ async def export_webhooks(format: str = "json", endpoint_id: Optional[str] = Non
 
 @app.get("/api/webhooks")
 async def list_webhooks(endpoint_id: Optional[str] = None, limit: int = 100):
+    if endpoint_id and not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
+
     webhooks = storage.get_webhooks(endpoint_id=endpoint_id, limit=limit)
-    # Parse JSON fields for the frontend
     for wh in webhooks:
         wh["headers"] = json.loads(wh["headers"]) if wh["headers"] else {}
         wh["query_params"] = json.loads(wh["query_params"]) if wh["query_params"] else {}
@@ -765,12 +876,13 @@ async def get_webhook(webhook_id: str):
 
 @app.get("/api/webhooks/{webhook_id}/export")
 async def export_single_webhook(webhook_id: str, format: str = "curl"):
+    _require_license()
     wh = storage.get_webhook(webhook_id)
     if not wh:
         raise HTTPException(status_code=404, detail="Webhook not found")
     wh["headers"] = json.loads(wh["headers"]) if wh["headers"] else {}
     wh["query_params"] = json.loads(wh["query_params"]) if wh["query_params"] else {}
-    
+
     if format == "postman":
         collection = {
             "info": {
@@ -786,7 +898,7 @@ async def export_single_webhook(webhook_id: str, format: str = "curl"):
             media_type="application/json",
             headers={"Content-Disposition": f"attachment; filename=webcatch-{webhook_id}.postman_collection.json"},
         )
-    
+
     if format == "curl":
         cmd = _webhook_to_curl(wh)
         return StreamingResponse(
@@ -794,18 +906,22 @@ async def export_single_webhook(webhook_id: str, format: str = "curl"):
             media_type="text/plain",
             headers={"Content-Disposition": f"attachment; filename=webcatch-{webhook_id}.sh"},
         )
-    
+
     raise HTTPException(status_code=400, detail="Format must be 'postman' or 'curl'")
 
 
 @app.delete("/api/webhooks/{webhook_id}")
 async def delete_webhook(webhook_id: str):
+    _require_license()
     storage.delete_webhook(webhook_id)
     return {"status": "deleted"}
 
 
 @app.delete("/api/endpoints/{endpoint_id}/webhooks")
 async def clear_endpoint(endpoint_id: str):
+    _require_license()
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     storage.delete_all_for_endpoint(endpoint_id)
     return {"status": "cleared"}
 
@@ -816,6 +932,8 @@ async def clear_endpoint(endpoint_id: str):
 
 @app.get("/api/endpoints/{endpoint_id}/config")
 async def get_endpoint_config(endpoint_id: str):
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     cfg = storage.get_endpoint_config(endpoint_id)
     if not cfg:
         return {"endpoint_id": endpoint_id, "status_code": 200, "response_headers": {}, "response_body": None, "forward_url": None, "retention_count": 0, "filter_rules": {}, "transform_script": None}
@@ -824,6 +942,9 @@ async def get_endpoint_config(endpoint_id: str):
 
 @app.put("/api/endpoints/{endpoint_id}/config")
 async def set_endpoint_config(endpoint_id: str, request: Request):
+    _require_license()
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     data = await request.json()
     storage.set_endpoint_config(
         endpoint_id=endpoint_id,
@@ -844,6 +965,9 @@ async def set_endpoint_config(endpoint_id: str, request: Request):
 
 @app.get("/api/endpoints/{endpoint_id}/schema")
 async def get_endpoint_schema(endpoint_id: str):
+    _require_license()
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     row = storage.get_schema(endpoint_id)
     if not row:
         raise HTTPException(status_code=404, detail="No schema inferred yet. Capture some JSON webhooks first.")
@@ -857,7 +981,9 @@ async def get_endpoint_schema(endpoint_id: str):
 
 @app.post("/api/endpoints/{endpoint_id}/schema/infer")
 async def infer_endpoint_schema(endpoint_id: str):
-    """Force re-inference of schema from recent webhooks."""
+    _require_license()
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     recent = storage.get_webhooks(endpoint_id, limit=500)
     bodies = [wh["body"] for wh in recent if wh.get("body")]
     schema = schema_engine.infer_schema(bodies)
@@ -873,12 +999,18 @@ async def infer_endpoint_schema(endpoint_id: str):
 
 @app.delete("/api/endpoints/{endpoint_id}/schema")
 async def delete_endpoint_schema(endpoint_id: str):
+    _require_license()
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     storage.delete_schema(endpoint_id)
     return {"status": "deleted"}
 
 
 @app.get("/api/endpoints/{endpoint_id}/schema/openapi")
 async def export_schema_openapi(endpoint_id: str):
+    _require_license()
+    if not _validate_endpoint_id(endpoint_id):
+        raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     row = storage.get_schema(endpoint_id)
     if not row:
         raise HTTPException(status_code=404, detail="No schema inferred yet.")
@@ -892,6 +1024,7 @@ async def export_schema_openapi(endpoint_id: str):
 
 @app.post("/api/webhooks/{webhook_id}/replay")
 async def replay_webhook(webhook_id: str, request: Request):
+    _require_license()
     wh = storage.get_webhook(webhook_id)
     if not wh:
         raise HTTPException(status_code=404, detail="Webhook not found")
@@ -904,13 +1037,13 @@ async def replay_webhook(webhook_id: str, request: Request):
     method = wh["method"]
     url = target_url or wh["url"]
 
-    # Remove hop-by-hop headers
     for h in ["host", "content-length", "transfer-encoding", "connection"]:
         headers.pop(h, None)
         headers.pop(h.title(), None)
 
     try:
-        async with aiohttp.ClientSession() as session:
+        replay_timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=replay_timeout) as session:
             async with session.request(method, url, headers=headers, data=body.encode("utf-8") if body else None) as resp:
                 resp_body = await resp.text()
                 return {
@@ -918,7 +1051,7 @@ async def replay_webhook(webhook_id: str, request: Request):
                     "original_webhook_id": webhook_id,
                     "target_url": url,
                     "response_status": resp.status,
-                    "response_body": resp_body[:2000],  # truncate
+                    "response_body": resp_body[:2000],
                 }
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Replay failed: {e}")
@@ -926,6 +1059,7 @@ async def replay_webhook(webhook_id: str, request: Request):
 
 @app.post("/api/bulk-replay")
 async def bulk_replay(request: Request):
+    _require_license()
     data = await request.json()
     webhook_ids = data.get("webhook_ids", [])
     target_url = data.get("url")
@@ -933,6 +1067,7 @@ async def bulk_replay(request: Request):
         raise HTTPException(status_code=400, detail="No webhook_ids provided")
 
     results = []
+    replay_timeout = aiohttp.ClientTimeout(total=30)
     for wh_id in webhook_ids:
         wh = storage.get_webhook(wh_id)
         if not wh:
@@ -946,7 +1081,7 @@ async def bulk_replay(request: Request):
             headers.pop(h, None)
             headers.pop(h.title(), None)
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=replay_timeout) as session:
                 async with session.request(method, url, headers=headers, data=body.encode("utf-8") if body else None) as resp:
                     resp_body = await resp.text()
                     results.append({
@@ -967,6 +1102,7 @@ async def bulk_replay(request: Request):
 
 @app.post("/api/test-webhook")
 async def test_webhook(request: Request):
+    _require_license()
     data = await request.json()
     target_url = data.get("url")
     method = data.get("method", "POST")
@@ -985,7 +1121,8 @@ async def test_webhook(request: Request):
                     headers['Content-Type'] = 'application/json'
             else:
                 req_body = body.encode('utf-8')
-        async with aiohttp.ClientSession() as session:
+        test_timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=test_timeout) as session:
             async with session.request(method, target_url, headers=headers, data=req_body) as resp:
                 resp_text = await resp.text()
                 return {
@@ -1004,6 +1141,7 @@ async def test_webhook(request: Request):
 
 @app.get("/api/webhooks/{webhook_a}/diff/{webhook_b}")
 async def diff_webhooks(webhook_a: str, webhook_b: str):
+    _require_license()
     a = storage.get_webhook(webhook_a)
     b = storage.get_webhook(webhook_b)
     if not a or not b:
@@ -1050,7 +1188,6 @@ async def verify_webhook_sig(webhook_id: str, request: Request):
     body = (wh["body"] or "").encode("utf-8")
     headers = json.loads(wh["headers"]) if wh["headers"] else {}
 
-    import signature as sig_module
     result = sig_module.verify_webhook(headers, body, secrets)
     return result
 
@@ -1061,7 +1198,6 @@ async def verify_webhook_sig(webhook_id: str, request: Request):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # Auth check for WebSocket
     if auth.AUTH_ENABLED:
         cookie = websocket.cookies.get(auth._COOKIE_NAME, "")
         if not cookie or not auth._verify_cookie_value(cookie):
@@ -1070,9 +1206,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Keep connection alive, handle any incoming messages
             data = await websocket.receive_text()
-            # Client can send ping/heartbeat or filter requests
             try:
                 msg = json.loads(data)
                 if msg.get("action") == "ping":
@@ -1089,7 +1223,19 @@ async def websocket_endpoint(websocket: WebSocket):
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "0.5.0", "local_llm": inspector.LOCAL_LLM_URL}
+    db_ok = True
+    try:
+        db_ok = storage.health_check()
+    except Exception:
+        db_ok = False
+    return {
+        "status": "ok" if db_ok else "db_error",
+        "version": "0.6.0",
+        "local_llm": inspector.LOCAL_LLM_URL,
+        "licensed": _is_licensed(),
+        "trial_limit": TRIAL_WEBHOOK_LIMIT,
+        "trial_used": storage.get_total_webhook_count(),
+    }
 
 
 @app.post("/api/login")
@@ -1109,12 +1255,12 @@ if __name__ == "__main__":
     uvicorn.run("main:app", host=HOST, port=PORT, reload=True)
 
 # ---------------------------------------------------------------------------
-# Stripe Checkout & License
+# Stripe Checkout & License (single $12 tier)
 # ---------------------------------------------------------------------------
 
 @app.post("/api/checkout")
 async def create_checkout():
-    if not STRIPE_SECRET_KEY:
+    if not stripe or not STRIPE_SECRET_KEY:
         return JSONResponse({"error": "Stripe not configured"}, status_code=500)
     try:
         session = stripe.checkout.Session.create(
@@ -1122,8 +1268,8 @@ async def create_checkout():
             line_items=[{
                 "price_data": {
                     "currency": "usd",
-                    "product_data": {"name": "Webcatch Pro License", "description": "Lifetime self-hosted Pro license"},
-                    "unit_amount": 3900,
+                    "product_data": {"name": "Webcatch License", "description": "Lifetime self-hosted license"},
+                    "unit_amount": 1200,
                 },
                 "quantity": 1,
             }],
@@ -1138,29 +1284,27 @@ async def create_checkout():
 
 @app.get("/success", response_class=HTMLResponse)
 async def checkout_success(session_id: str = None):
-    if not session_id or not STRIPE_SECRET_KEY:
+    if not session_id or not stripe:
         return "<h1>Missing session</h1><p>Please contact support.</p>"
     try:
         sess = stripe.checkout.Session.retrieve(session_id)
         if sess.payment_status != "paid":
             return "<h1>Payment not completed</h1><p>If you believe this is an error, contact support.</p>"
-        
-        # Check if we already generated a license for this session
-        # (In a real app you'd query by stripe_session_id; here we generate fresh each time for simplicity)
-        lic_key = license.create_license(
+
+        lic_key = lic_module.create_license(
             email=sess.customer_details.email if sess.customer_details else None,
             stripe_session_id=session_id
         )
-        
+
         return f"""<!DOCTYPE html>
-<html><head><title>Webcatch Pro — Success</title>
+<html><head><title>Webcatch — Success</title>
 <style>
 body {{ background: #0d1117; color: #c9d1d9; font-family: sans-serif; text-align: center; padding: 80px 20px; }}
 h1 {{ color: #58a6ff; }} .key {{ background: #161b22; border: 1px solid #30363d; padding: 16px 24px; border-radius: 8px;
 font-family: monospace; font-size: 1.1rem; color: #3fb950; margin: 20px auto; display: inline-block; }}
 .btn {{ background: #58a6ff; color: #0d1117; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: 600; display: inline-block; margin-top: 20px; }}
 </style></head><body>
-<h1>🎉 Welcome to Webcatch Pro!</h1>
+<h1>🎉 Welcome to Webcatch!</h1>
 <p>Your payment was successful. Here is your license key:</p>
 <div class="key">{lic_key}</div>
 <p>Copy this key and paste it into your self-hosted Webcatch app under Settings → License.</p>
@@ -1173,16 +1317,16 @@ font-family: monospace; font-size: 1.1rem; color: #3fb950; margin: 20px auto; di
 @app.post("/api/license/validate")
 async def validate_license(request: Request):
     data = await request.json()
-    key = data.get("key", "")
-    if license.validate_license(key):
-        license.mark_validated(key)
-        return {"valid": True}
-    return {"valid": False}
+    key = data.get("key", "").strip()
+    if not key:
+        return {"valid": False, "error": "No key provided"}
+    result = lic_module.validate_and_activate(key, request.client.host if request.client else "unknown")
+    return result
 
 
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
-    if not STRIPE_WEBHOOK_SECRET:
+    if not stripe or not STRIPE_WEBHOOK_SECRET:
         return JSONResponse({"error": "Webhook secret not configured"}, status_code=500)
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
@@ -1192,13 +1336,12 @@ async def stripe_webhook(request: Request):
         return JSONResponse({"error": "Invalid payload"}, status_code=400)
     except stripe.error.SignatureVerificationError:
         return JSONResponse({"error": "Invalid signature"}, status_code=400)
-    
+
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         if session.payment_status == "paid":
-            license.create_license(
+            lic_module.create_license(
                 email=session.customer_details.email if session.customer_details else None,
                 stripe_session_id=session.id
             )
     return {"status": "ok"}
-

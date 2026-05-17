@@ -391,3 +391,22 @@ def update_forward_status(webhook_id: str, status: int, response: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def get_total_webhook_count() -> int:
+    """Return total number of captured webhooks across all endpoints."""
+    conn = _get_conn()
+    row = conn.execute("SELECT COUNT(*) as c FROM webhooks").fetchone()
+    conn.close()
+    return row["c"] if row else 0
+
+
+def health_check() -> bool:
+    """Quick DB connectivity check."""
+    try:
+        conn = _get_conn()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        return True
+    except Exception:
+        return False

@@ -6,32 +6,30 @@ Set WEBCATCH_PASSWORD env var to enable. If not set, everything is open.
 import os
 import hmac
 import hashlib
+import secrets
 import time
 from typing import Optional
 from fastapi import Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# If this env var is set, auth is required for all non-capture routes
 AUTH_PASSWORD = os.getenv("WEBCATCH_PASSWORD", "").strip()
 AUTH_ENABLED = bool(AUTH_PASSWORD)
 _COOKIE_NAME = "webcatch_session"
 _COOKIE_MAX_AGE = 86400 * 30  # 30 days
+_CSRF_COOKIE = "webcatch_csrf"
 
 
 def _sign(value: str) -> str:
-    """Sign a value with HMAC-SHA256 using the auth password."""
     return hmac.new(AUTH_PASSWORD.encode(), value.encode(), hashlib.sha256).hexdigest()
 
 
 def _make_cookie_value() -> str:
-    """Create a signed session cookie value."""
     ts = str(int(time.time()))
     sig = _sign(ts)
     return f"{ts}:{sig}"
 
 
 def _verify_cookie_value(cookie: str) -> bool:
-    """Verify a session cookie hasn't been tampered with and isn't expired."""
     try:
         ts, sig = cookie.split(":", 1)
         expected = _sign(ts)
@@ -43,8 +41,21 @@ def _verify_cookie_value(cookie: str) -> bool:
         return False
 
 
+def generate_csrf_token() -> str:
+    """Generate a random CSRF token."""
+    return secrets.token_urlsafe(32)
+
+
+def _verify_csrf(request: Request) -> bool:
+    """Verify CSRF token from header against cookie."""
+    cookie = request.cookies.get(_CSRF_COOKIE, "")
+    header = request.headers.get("x-csrf-token", "")
+    if not cookie or not header:
+        return False
+    return hmac.compare_digest(cookie, header)
+
+
 def require_auth(request: Request):
-    """FastAPI dependency: raise 401 if auth is enabled and cookie is missing/invalid."""
     if not AUTH_ENABLED:
         return True
     cookie = request.cookies.get(_COOKIE_NAME, "")
@@ -54,32 +65,56 @@ def require_auth(request: Request):
 
 
 def is_authenticated(request: Request) -> bool:
-    """Check if the current request is authenticated (for optional checks)."""
     if not AUTH_ENABLED:
         return True
     cookie = request.cookies.get(_COOKIE_NAME, "")
     return bool(cookie and _verify_cookie_value(cookie))
 
 
+def require_csrf(request: Request):
+    """Raise 403 if CSRF token is missing or mismatched."""
+    if not AUTH_ENABLED:
+        return True
+    if _verify_csrf(request):
+        return True
+    raise HTTPException(status_code=403, detail="CSRF token invalid")
+
+
+def _is_secure() -> bool:
+    """Return True if we should set secure cookie flags."""
+    return os.getenv("WEBCATCH_ENV", "development").lower() in ("production", "staging")
+
+
 def login_response(password: str) -> Optional[JSONResponse]:
-    """Validate password and return a response with the session cookie set."""
     if not AUTH_ENABLED:
         return JSONResponse({"status": "ok", "message": "Auth not configured"})
     if password == AUTH_PASSWORD:
-        resp = JSONResponse({"status": "ok", "authenticated": True})
+        resp = JSONResponse({"status": "ok", "authenticated": True, "csrf_token": generate_csrf_token()})
+        secure = _is_secure()
         resp.set_cookie(
             _COOKIE_NAME,
             _make_cookie_value(),
             max_age=_COOKIE_MAX_AGE,
             httponly=True,
-            samesite="lax",
+            samesite="strict" if secure else "lax",
+            secure=secure,
+        )
+        # Set CSRF cookie for state-changing requests
+        csrf = generate_csrf_token()
+        resp.set_cookie(
+            _CSRF_COOKIE,
+            csrf,
+            max_age=_COOKIE_MAX_AGE,
+            httponly=False,
+            samesite="strict" if secure else "lax",
+            secure=secure,
         )
         return resp
     return JSONResponse({"status": "error", "message": "Invalid password"}, status_code=403)
 
 
 def logout_response() -> JSONResponse:
-    """Return a response that clears the session cookie."""
     resp = JSONResponse({"status": "ok", "authenticated": False})
     resp.delete_cookie(_COOKIE_NAME)
+    resp.delete_cookie(_CSRF_COOKIE)
     return resp

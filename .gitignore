@@ -1,27 +1,8 @@
-# Secrets
-.env
-*.pem
-*.key
-
-# Python
 __pycache__/
-*.py[cod]
-*.egg-info/
+*.pyc
+*.pyo
+.env
+*.db
+data/
 .venv/
 venv/
-
-# DB / data
-*.db
-*.sqlite
-*.sqlite3
-data/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
