@@ -25,7 +25,7 @@ Webcatch is a single Docker container that captures, replays, and analyzes webho
 
 **Pricing:** Free (100 recent webhooks) or $39 lifetime Pro (unlimited history, bulk replay, team sharing up to 5).
 
-MIT licensed. GitHub: https://github.com/bellum19/webcatch
+MIT licensed. GitHub: https://github.com/webcatchdev/webcatch
 
 I'd love feedback on the schema inference and local LLM integration. What would make this your default webhook tool?
 
@@ -54,7 +54,7 @@ So I built **Webcatch** — a webhook inspector that runs entirely on your machi
 
 **Stack:** Python, FastAPI, SQLite, vanilla JS, WebSocket.
 
-Repo: https://github.com/bellum19/webcatch
+Repo: https://github.com/webcatchdev/webcatch
 
 Questions, feedback, or roasting welcome. What would make you switch from Hookdeck / Svix / Webhook.site?
 
@@ -82,7 +82,7 @@ I built a webhook capture tool that runs in a single Docker container. Everythin
 
 Free / $39 lifetime Pro.
 
-GitHub: https://github.com/bellum19/webcatch
+GitHub: https://github.com/webcatchdev/webcatch
 
 Curious if the selfhosted crowd finds the local LLM integration useful, or if that's just me being nerdy.
 
@@ -118,7 +118,7 @@ MIT licensed. Free or $39 lifetime Pro.
 **Tweet 4 (CTA):**
 If you debug webhooks and care about privacy, this is for you.
 
-🐛 github.com/bellum19/webcatch
+🐛 github.com/webcatchdev/webcatch
 
 Star ⭐ if you dig it. Issues and PRs welcome.
 
@@ -164,10 +164,10 @@ It's called Webcatch. One Docker command and you have:
 
 I use it for Stripe, GitHub, and Shopify webhooks. If you work with webhooks and care about privacy, check it out:
 
-https://github.com/bellum19/webcatch
+https://github.com/webcatchdev/webcatch
 
 It's MIT licensed. Free forever, or $39 for Pro (unlimited history, bulk replay, team sharing).
 
 Let me know what you think.
 
-— bellum19
+— webcatchdev

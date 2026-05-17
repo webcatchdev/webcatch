@@ -27,7 +27,7 @@ docker run -d \
   -p 9120:9120 \
   -v ./data:/app/data \
   -e WEBCATCH_ANALYZE_ON_CAPTURE=false \
-  ghcr.io/bellum19/webcatch:latest
+  ghcr.io/webcatchdev/webcatch:latest
 ```
 
 Open http://localhost:9120
