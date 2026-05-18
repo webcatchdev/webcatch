@@ -5,6 +5,25 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Webcatch — Self-hosted webhook inspector</title>
 <meta name="description" content="Self-hosted webhook capture, replay, and AI analysis. All data stays on your machine. No cloud. No telemetry.">
+
+<!-- Open Graph / Social Preview -->
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://webcatch.dev">
+<meta property="og:title" content="Webcatch — Self-hosted webhook inspector">
+<meta property="og:description" content="Self-hosted webhook capture, replay, and AI analysis. All data stays on your machine. No cloud. No telemetry.">
+<meta property="og:image" content="https://webcatch.dev/static/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:url" content="https://webcatch.dev">
+<meta name="twitter:title" content="Webcatch — Self-hosted webhook inspector">
+<meta name="twitter:description" content="Self-hosted webhook capture, replay, and AI analysis. All data stays on your machine. No cloud. No telemetry.">
+<meta name="twitter:image" content="https://webcatch.dev/static/og-image.png">
+
+<!-- Favicon -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔍</text></svg>">
 <style>
 :root {
     --bg: #0d1117;
@@ -236,7 +255,7 @@ footer a { color: var(--text-secondary); }
                 <tr><td>Schema inference</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
                 <tr><td>Signature verification</td><td class="check">✓</td><td class="check">✓</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td></tr>
                 <tr><td>Postman / cURL export</td><td class="check">✓</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td><td class="cross">✗</td></tr>
-                <tr><td>Pricing</td><td class="highlight">Free / $39 lifetime</td><td>$25+/mo</td><td>$100+/mo</td><td>Free / Pro</td><td>Free / Pro</td></tr>
+                <tr><td>Pricing</td><td class="highlight">$12 one-time</td><td>$25+/mo</td><td>$100+/mo</td><td>Free / Pro</td><td>Free / Pro</td></tr>
             </tbody>
         </table>
     </div>
@@ -245,33 +264,23 @@ footer a { color: var(--text-secondary); }
 <section class="pricing" id="pricing">
     <div class="container">
         <h2>Simple pricing</h2>
-        <div class="pricing-grid">
-            <div class="price-card">
-                <h3>Free</h3>
-                <div class="price">$0</div>
+        <div class="pricing-grid" style="max-width: 400px;">
+            <div class="price-card pro">
+                <h3>Webcatch</h3>
+                <div class="price">$12 <span>one-time</span></div>
                 <ul>
                     <li>Unlimited endpoints</li>
+                    <li>Unlimited history</li>
                     <li>Real-time dashboard</li>
                     <li>Replay &amp; forwarding</li>
                     <li>AI analysis (local LLM)</li>
                     <li>Schema inference</li>
                     <li>Signature verification</li>
-                    <li>100 recent webhooks</li>
-                </ul>
-                <a href="https://github.com/webcatchdev/webcatch" class="btn btn-outline" style="width:100%;">Download</a>
-            </div>
-            <div class="price-card pro">
-                <h3>Pro</h3>
-                <div class="price">$39 <span>lifetime</span></div>
-                <ul>
-                    <li>Everything in Free</li>
-                    <li>Unlimited history</li>
                     <li>Custom responses</li>
-                    <li>Bulk replay</li>
-                    <li>Team sharing (up to 5)</li>
-                    <li>Priority support</li>
+                    <li>Postman / cURL export</li>
+                    <li>Lifetime updates</li>
                 </ul>
-                <a href="https://github.com/webcatchdev/webcatch#pricing" class="btn" style="width:100%;">Buy Pro</a>
+                <a href="https://github.com/webcatchdev/webcatch" class="btn" style="width:100%;">Get Started</a>
             </div>
         </div>
     </div>

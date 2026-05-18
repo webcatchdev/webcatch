@@ -1615,7 +1615,7 @@ async def health():
         db_ok = False
     return {
         "status": "ok" if db_ok else "db_error",
-        "version": "0.6.1",
+        "version": "0.6.2",
         "licensed": _is_licensed(),
         "trial_limit": TRIAL_WEBHOOK_LIMIT,
         "trial_used": storage.get_capture_event_count(),
