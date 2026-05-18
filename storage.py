@@ -69,6 +69,49 @@ def init_db() -> None:
         INSERT OR IGNORE INTO capture_events (id, count) VALUES (1, 0)
         """
     )
+    # Real endpoints table
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS endpoints (
+            endpoint_id TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    # Ensure endpoint_configs exists before migrating from it
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS endpoint_configs (
+            endpoint_id TEXT PRIMARY KEY,
+            forward_url TEXT,
+            transform_script TEXT,
+            response_body TEXT,
+            response_headers TEXT,
+            status_code INTEGER DEFAULT 200,
+            filter_rules TEXT,
+            retention_count INTEGER,
+            updated_at TEXT
+        )
+        """
+    )
+    # Migrate existing endpoints from configs/webhooks
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO endpoints (endpoint_id, enabled, created_at, updated_at)
+        SELECT endpoint_id, 1, datetime('now'), datetime('now')
+        FROM endpoint_configs
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO endpoints (endpoint_id, enabled, created_at, updated_at)
+        SELECT DISTINCT endpoint_id, 1, datetime('now'), datetime('now')
+        FROM webhooks
+        WHERE endpoint_id NOT IN (SELECT endpoint_id FROM endpoints)
+        """
+    )
     # Migration: add forward columns if missing (old dbs)
     for col in ["forward_status", "forward_response", "forwarded_at"]:
         try:
@@ -147,6 +190,50 @@ def init_endpoint_config() -> None:
     conn.close()
 
 
+def init_security_tables() -> None:
+    conn = _get_conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip_address TEXT NOT NULL,
+            attempted_at REAL NOT NULL,
+            success INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time ON login_attempts(ip_address, attempted_at)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def check_login_rate_limit_persistent(client_ip: str, max_attempts: int = 5, window: int = 900) -> bool:
+    import time
+    now = time.time()
+    cutoff = now - window
+    conn = _get_conn()
+    conn.execute("DELETE FROM login_attempts WHERE attempted_at < ?", (cutoff,))
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM login_attempts
+        WHERE ip_address = ? AND attempted_at >= ? AND success = 0
+        """,
+        (client_ip, cutoff),
+    ).fetchone()
+    allowed = row["c"] < max_attempts
+    if allowed:
+        conn.execute(
+            "INSERT INTO login_attempts (ip_address, attempted_at, success) VALUES (?, ?, 0)",
+            (client_ip, now),
+        )
+    conn.commit()
+    conn.close()
+    return allowed
+
+
 def set_endpoint_config(
     endpoint_id: str,
     status_code: int = 200,
@@ -195,36 +282,60 @@ def get_endpoint_config(endpoint_id: str) -> Optional[dict]:
 
 def create_endpoint() -> str:
     endpoint_id = uuid.uuid4().hex[:12]
-    return endpoint_id
-
-
-def set_endpoint_enabled(endpoint_id: str, enabled: bool) -> None:
+    now = datetime.now(timezone.utc).isoformat()
     conn = _get_conn()
     conn.execute(
-        "INSERT INTO endpoint_configs (endpoint_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?)"
-        " ON CONFLICT(endpoint_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
-        (endpoint_id, 1 if enabled else 0, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO endpoints (endpoint_id, enabled, created_at, updated_at) VALUES (?, 1, ?, ?)",
+        (endpoint_id, now, now),
     )
     conn.commit()
     conn.close()
+    return endpoint_id
+
+
+def set_endpoint_enabled(endpoint_id: str, enabled: bool) -> bool:
+    conn = _get_conn()
+    cur = conn.execute(
+        """
+        UPDATE endpoints
+        SET enabled = ?, updated_at = ?
+        WHERE endpoint_id = ?
+        """,
+        (1 if enabled else 0, datetime.now(timezone.utc).isoformat(), endpoint_id),
+    )
+    conn.commit()
+    changed = cur.rowcount > 0
+    conn.close()
+    return changed
 
 
 def get_all_endpoint_ids() -> list:
     conn = _get_conn()
-    rows = conn.execute("SELECT DISTINCT endpoint_id FROM endpoint_configs UNION SELECT DISTINCT endpoint_id FROM webhooks").fetchall()
+    rows = conn.execute("SELECT endpoint_id FROM endpoints ORDER BY created_at DESC").fetchall()
     conn.close()
-    return [r[0] for r in rows if r[0]]
+    return [r["endpoint_id"] for r in rows]
 
 
 def get_endpoint(endpoint_id: str) -> Optional[dict]:
     conn = _get_conn()
-    row = conn.execute("SELECT * FROM endpoint_configs WHERE endpoint_id = ?", (endpoint_id,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT e.endpoint_id, e.enabled, e.created_at, e.updated_at,
+               c.status_code, c.response_headers, c.response_body,
+               c.forward_url, c.retention_count, c.filter_rules, c.transform_script
+        FROM endpoints e
+        LEFT JOIN endpoint_configs c ON c.endpoint_id = e.endpoint_id
+        WHERE e.endpoint_id = ?
+        """,
+        (endpoint_id,),
+    ).fetchone()
     conn.close()
     if not row:
-        return {"endpoint_id": endpoint_id, "enabled": True}
+        return None
     cfg = dict(row)
-    cfg["response_headers"] = json.loads(cfg["response_headers"]) if cfg["response_headers"] else {}
     cfg["enabled"] = bool(cfg.get("enabled", 1))
+    cfg["response_headers"] = json.loads(cfg["response_headers"]) if cfg.get("response_headers") else {}
+    cfg["filter_rules"] = json.loads(cfg["filter_rules"]) if cfg.get("filter_rules") else {}
     return cfg
 
 

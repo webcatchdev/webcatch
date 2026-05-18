@@ -14,13 +14,26 @@ from fastapi.responses import JSONResponse
 
 AUTH_PASSWORD = os.getenv("WEBCATCH_PASSWORD", "").strip()
 AUTH_ENABLED = bool(AUTH_PASSWORD)
+
+SESSION_SECRET = os.getenv("WEBCATCH_SESSION_SECRET", "").strip()
+_IS_PRODUCTION = os.getenv("WEBCATCH_ENV", "development").lower() == "production"
+
+if _IS_PRODUCTION and len(SESSION_SECRET) < 32:
+    raise RuntimeError(
+        "WEBCATCH_SESSION_SECRET must be set to at least 32 random bytes/chars in production"
+    )
+
+if not SESSION_SECRET:
+    # Dev-only ephemeral secret; cookies invalidate on restart
+    SESSION_SECRET = secrets.token_hex(32)
+
 _COOKIE_NAME = "webcatch_session"
 _COOKIE_MAX_AGE = 86400 * 30  # 30 days
 _CSRF_COOKIE = "webcatch_csrf"
 
 
 def _sign(value: str) -> str:
-    return hmac.new(AUTH_PASSWORD.encode(), value.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(SESSION_SECRET.encode(), value.encode(), hashlib.sha256).hexdigest()
 
 
 def _make_cookie_value() -> str:

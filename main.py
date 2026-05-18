@@ -82,17 +82,84 @@ _ENDPOINT_ID_RE = re.compile(r"^[a-f0-9]{12}$")
 ANALYZE_ON_CAPTURE = os.getenv("WEBCATCH_ANALYZE_ON_CAPTURE", "false").lower() in {"1", "true", "yes", "on"}
 LLM_ANALYSIS_CONCURRENCY = int(os.getenv("WEBCATCH_LLM_CONCURRENCY", "1"))
 
-# Transforms gated by default — exec() sandbox is not secure without RestrictedPython
-ENABLE_TRANSFORMS = os.getenv("WEBCATCH_ENABLE_TRANSFORMS", "false").lower() in {"1", "true", "yes", "on"}
+# Transforms permanently disabled — exec() sandbox is not secure.
+ENABLE_TRANSFORMS = False
 
 # In-memory rate limiter: {ip: [(timestamp, count), ...]}
 _rate_limiter: dict[str, list] = defaultdict(list)
 _rate_limiter_lock = asyncio.Lock()
 
-# Login rate limiter: {ip: [(timestamp), ...]}
-_login_rate_limiter: dict[str, list] = defaultdict(list)
-_LOGIN_RATE_LIMIT_MAX = 5
-_LOGIN_RATE_LIMIT_WINDOW = 900  # 15 minutes
+# API-wide rate limiter: {ip: [(timestamp), ...]}
+_API_RATE_LIMITER: dict[str, list[float]] = defaultdict(list)
+_API_RATE_LOCK = asyncio.Lock()
+_API_RATE_WINDOW = int(os.getenv("WEBCATCH_API_RATE_LIMIT_WINDOW", "60"))
+_API_RATE_MAX = int(os.getenv("WEBCATCH_API_RATE_LIMIT_MAX", "120"))
+
+# Secret header redaction
+_SENSITIVE_HEADER_NAMES = {
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-api-key", "api-key", "x-auth-token", "x-access-token",
+    "x-signature", "stripe-signature",
+}
+_SENSITIVE_HEADER_PATTERNS = ("token", "secret", "password", "credential", "apikey", "api-key")
+
+
+def _redact_headers(headers: dict) -> dict:
+    redacted = {}
+    for key, value in headers.items():
+        lk = key.lower()
+        if lk in _SENSITIVE_HEADER_NAMES or any(p in lk for p in _SENSITIVE_HEADER_PATTERNS):
+            redacted[key] = "[REDACTED]"
+        else:
+            redacted[key] = value
+    return redacted
+
+
+# ASGI-level body size limit middleware
+class BodyTooLarge(Exception):
+    pass
+
+
+class MaxBodySizeMiddleware:
+    def __init__(self, app, max_body_size: int):
+        self.app = app
+        self.max_body_size = max_body_size
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        total = 0
+        response_started = False
+
+        async def send_wrapper(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        async def limited_receive():
+            nonlocal total
+            message = await receive()
+            if message["type"] == "http.request":
+                body = message.get("body", b"")
+                total += len(body)
+                if total > self.max_body_size:
+                    raise BodyTooLarge()
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send_wrapper)
+        except BodyTooLarge:
+            if not response_started:
+                from starlette.responses import JSONResponse
+                resp = JSONResponse(
+                    {"status": "payload_too_large", "message": f"Max body size is {self.max_body_size} bytes"},
+                    status_code=413,
+                )
+                await resp(scope, receive, send)
+
 
 
 def _clean_rate_limiter():
@@ -189,7 +256,14 @@ def _is_safe_url(url: str) -> bool:
     return True
 
 
-def _resolve_safe_url(url: str) -> tuple[str, dict] | None:
+async def _getaddrinfo_async(hostname: str, port: int | None = None):
+    return await asyncio.wait_for(
+        asyncio.to_thread(socket.getaddrinfo, hostname, port),
+        timeout=3.0,
+    )
+
+
+async def _resolve_safe_url_async(url: str) -> tuple[str, dict] | None:
     """Resolve URL to a safe IP and return (pinned_url, extra_headers). Returns None if unsafe."""
     parsed = urlparse(url)
     if not parsed.hostname:
@@ -200,29 +274,26 @@ def _resolve_safe_url(url: str) -> tuple[str, dict] | None:
         ip = ipaddress.ip_address(parsed.hostname)
         if _ip_is_blocked(ip):
             return None
-        # Already an IP, no need to pin
         return url, {}
     except ValueError:
         pass
-    # Resolve hostname
     try:
-        resolved = socket.getaddrinfo(parsed.hostname, None)
-        safe_ips = []
-        for _, _, _, _, addr in resolved:
-            ip = ipaddress.ip_address(addr[0])
-            if _ip_is_blocked(ip):
-                return None
-            safe_ips.append(addr[0])
-        if not safe_ips:
-            return None
-        # Pin to first safe IP, preserve Host header
-        default_port = 443 if parsed.scheme == "https" else 80
-        pinned = f"{parsed.scheme}://{safe_ips[0]}:{parsed.port or default_port}{parsed.path}"
-        if parsed.query:
-            pinned += f"?{parsed.query}"
-        return pinned, {"Host": parsed.hostname}
-    except socket.gaierror:
+        resolved = await _getaddrinfo_async(parsed.hostname, None)
+    except Exception:
         return None
+    safe_ips = []
+    for _, _, _, _, addr in resolved:
+        ip = ipaddress.ip_address(addr[0])
+        if _ip_is_blocked(ip):
+            return None
+        safe_ips.append(addr[0])
+    if not safe_ips:
+        return None
+    default_port = 443 if parsed.scheme == "https" else 80
+    pinned = f"{parsed.scheme}://{safe_ips[0]}:{parsed.port or default_port}{parsed.path}"
+    if parsed.query:
+        pinned += f"?{parsed.query}"
+    return pinned, {"Host": parsed.hostname}
 
 
 _MAX_RESPONSE_TEXT = 256_000  # 256 KB cap on any downstream response body
@@ -240,16 +311,22 @@ async def _safe_resp_text(resp) -> str:
     return b"".join(chunks).decode("utf-8", errors="replace")
 
 
-def _check_login_rate_limit(client_ip: str) -> bool:
-    """Return True if login attempt is allowed."""
+async def _check_api_rate_limit(client_ip: str) -> bool:
+    """Return True if API request is allowed."""
     now = time.time()
-    cutoff = now - _LOGIN_RATE_LIMIT_WINDOW
-    entries = _login_rate_limiter[client_ip]
-    entries[:] = [t for t in entries if t > cutoff]
-    if len(entries) >= _LOGIN_RATE_LIMIT_MAX:
-        return False
-    entries.append(now)
-    return True
+    cutoff = now - _API_RATE_WINDOW
+    async with _API_RATE_LOCK:
+        entries = _API_RATE_LIMITER[client_ip]
+        entries[:] = [t for t in entries if t > cutoff]
+        if len(entries) >= _API_RATE_MAX:
+            return False
+        entries.append(now)
+        return True
+
+
+async def _check_login_rate_limit(client_ip: str) -> bool:
+    """Return True if login attempt is allowed (persistent, via storage)."""
+    return storage.check_login_rate_limit_persistent(client_ip)
 
 
 # Auth fail-closed: refuse to start in production without a password
@@ -262,28 +339,28 @@ active_endpoints: dict[str, str] = {}
 
 
 class ConnectionManager:
-    """WebSocket connection manager for real-time dashboard updates."""
+    """WebSocket connection manager scoped to endpoints."""
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: dict[str, set[WebSocket]] = defaultdict(set)
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, endpoint_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[endpoint_id].add(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, endpoint_id: str, websocket: WebSocket):
+        self.active_connections[endpoint_id].discard(websocket)
+        if not self.active_connections[endpoint_id]:
+            del self.active_connections[endpoint_id]
 
-    async def broadcast(self, message: dict):
+    async def broadcast(self, endpoint_id: str, message: dict):
         disconnected = []
-        # Snapshot list to avoid mutation during iteration
-        for connection in list(self.active_connections):
+        for connection in list(self.active_connections.get(endpoint_id, set())):
             try:
                 await connection.send_json(message)
             except Exception:
                 disconnected.append(connection)
         for conn in disconnected:
-            self.disconnect(conn)
+            self.disconnect(endpoint_id, conn)
 
 
 manager = ConnectionManager()
@@ -300,7 +377,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Webcatch", version="0.6.1", lifespan=lifespan)
+app = FastAPI(title="Webcatch", version="0.6.2", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=os.path.join(APP_DIR, "static")), name="static")
 
 # CORS — only allow same-origin in production; permissive in dev
@@ -325,29 +402,27 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self'; style-src 'self';"
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
     )
     return response
 
 
 @app.middleware("http")
-async def body_size_limit(request: Request, call_next):
-    """Reject requests with body larger than MAX_BODY_SIZE before reading."""
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            length = int(content_length)
-        except ValueError:
+async def api_rate_limit_middleware(request: Request, call_next):
+    """Rate limit all /api/* routes except health and login."""
+    path = request.url.path
+    if path.startswith("/api/") and path not in {"/api/health", "/api/login"}:
+        client_ip = request.client.host if request.client else "unknown"
+        if not await _check_api_rate_limit(client_ip):
             return JSONResponse(
-                content={"status": "bad_request", "message": "Invalid Content-Length header"},
-                status_code=400,
-            )
-        if length > MAX_BODY_SIZE:
-            return JSONResponse(
-                content={"status": "payload_too_large", "message": f"Max body size is {MAX_BODY_SIZE} bytes"},
-                status_code=413,
+                {"error": "Rate limit exceeded"},
+                status_code=429,
             )
     return await call_next(request)
+
+
+# Register ASGI-level body size limit
+app.add_middleware(MaxBodySizeMiddleware, max_body_size=MAX_BODY_SIZE)
 
 
 # ---------------------------------------------------------------------------
@@ -632,11 +707,12 @@ async def capture_webhook(endpoint_id: str, request: Request):
 
     # Store it (atomic trial check inside storage layer)
     latency_ms = (time.time() - start_time) * 1000
+    redacted_headers = _redact_headers(headers)
     webhook_id = storage.store_webhook(
         endpoint_id=endpoint_id,
         method=request.method,
         url=str(request.url),
-        headers=headers,
+        headers=redacted_headers,
         body=body,
         query_params=query_params,
         client_ip=client_ip,
@@ -658,7 +734,7 @@ async def capture_webhook(endpoint_id: str, request: Request):
     body_text = body.decode("utf-8", errors="replace") if body else None
     if ANALYZE_ON_CAPTURE:
         asyncio.create_task(
-            _analyze_and_store(webhook_id, request.method, str(request.url), headers, body_text, query_params)
+            _analyze_and_store(endpoint_id, webhook_id, request.method, str(request.url), headers, body_text, query_params)
         )
 
     # Fire-and-forget schema inference + validation
@@ -670,7 +746,7 @@ async def capture_webhook(endpoint_id: str, request: Request):
     # Fire-and-forget forwarding if configured
     if config and config.get("forward_url"):
         asyncio.create_task(
-            _forward_webhook(webhook_id, request.method, config["forward_url"], headers, body, query_params, transform_script=config.get("transform_script"))
+            _forward_webhook(endpoint_id, webhook_id, request.method, config["forward_url"], headers, body, query_params, transform_script=config.get("transform_script"))
         )
 
     # Broadcast to all connected WebSocket clients
@@ -681,7 +757,7 @@ async def capture_webhook(endpoint_id: str, request: Request):
             "endpoint_id": endpoint_id,
             "method": request.method,
             "url": str(request.url),
-            "headers": headers,
+            "headers": redacted_headers,
             "body": body_text,
             "query_params": query_params,
             "client_ip": client_ip,
@@ -692,7 +768,7 @@ async def capture_webhook(endpoint_id: str, request: Request):
             "validation_errors": None,
         },
     }
-    asyncio.create_task(manager.broadcast(webhook_data))
+    asyncio.create_task(manager.broadcast(endpoint_id, webhook_data))
 
     # Check for custom response config
     if config:
@@ -712,6 +788,7 @@ async def capture_webhook(endpoint_id: str, request: Request):
 
 
 async def _analyze_and_store(
+    endpoint_id: str,
     webhook_id: str,
     method: str,
     url: str,
@@ -726,7 +803,7 @@ async def _analyze_and_store(
             analysis = await inspector.analyze_webhook(method, url, headers, body, query_params)
         elapsed_ms = (time.time() - start) * 1000
         storage.update_analysis(webhook_id, analysis, analysis_time_ms=round(elapsed_ms, 2))
-        await manager.broadcast({
+        await manager.broadcast(endpoint_id, {
             "type": "analysis_update",
             "webhook_id": webhook_id,
             "analysis": analysis,
@@ -735,7 +812,7 @@ async def _analyze_and_store(
     except Exception as e:
         elapsed_ms = (time.time() - start) * 1000
         storage.update_analysis(webhook_id, f"Analysis failed: {e}", analysis_time_ms=round(elapsed_ms, 2))
-        await manager.broadcast({
+        await manager.broadcast(endpoint_id, {
             "type": "analysis_update",
             "webhook_id": webhook_id,
             "analysis": f"Analysis failed: {e}",
@@ -756,7 +833,7 @@ async def _infer_and_validate_schema(endpoint_id: str, webhook_id: str, body_tex
             validation_errors = schema_engine.validate_body(body_text, schema)
             if validation_errors:
                 storage.update_validation_errors(webhook_id, validation_errors)
-                await manager.broadcast({
+                await manager.broadcast(endpoint_id, {
                     "type": "validation_update",
                     "webhook_id": webhook_id,
                     "validation_errors": validation_errors,
@@ -764,7 +841,10 @@ async def _infer_and_validate_schema(endpoint_id: str, webhook_id: str, body_tex
 
         recent = storage.get_webhooks(endpoint_id, limit=200)
         bodies = [wh["body"] for wh in recent if wh.get("body")]
-        new_schema = schema_engine.infer_schema(bodies)
+        new_schema = await asyncio.wait_for(
+            asyncio.to_thread(schema_engine.infer_schema, bodies),
+            timeout=5.0,
+        )
         if new_schema:
             storage.set_schema(endpoint_id, new_schema, len(bodies))
     except Exception:
@@ -819,6 +899,7 @@ def _run_transform_sync(script: str, method: str, url: str, headers: dict, body:
 
 
 async def _forward_webhook(
+    endpoint_id: str,
     webhook_id: str,
     method: str,
     forward_url: str,
@@ -837,7 +918,7 @@ async def _forward_webhook(
     if transform_script and transform_script.strip():
         if not ENABLE_TRANSFORMS:
             storage.update_forward_status(webhook_id, 0, "Transforms are disabled")
-            await manager.broadcast({
+            await manager.broadcast(endpoint_id, {
                 "type": "forward_update",
                 "webhook_id": webhook_id,
                 "forward_status": 0,
@@ -860,7 +941,7 @@ async def _forward_webhook(
             )
             if t_error:
                 storage.update_forward_status(webhook_id, 0, f"Transform error: {t_error}")
-                await manager.broadcast({
+                await manager.broadcast(endpoint_id, {
                     "type": "forward_update",
                     "webhook_id": webhook_id,
                     "forward_status": 0,
@@ -874,7 +955,7 @@ async def _forward_webhook(
             body = t_body.encode("utf-8") if t_body else None
         except asyncio.TimeoutError:
             storage.update_forward_status(webhook_id, 0, "Transform error: script timed out after 5s")
-            await manager.broadcast({
+            await manager.broadcast(endpoint_id, {
                 "type": "forward_update",
                 "webhook_id": webhook_id,
                 "forward_status": 0,
@@ -882,7 +963,7 @@ async def _forward_webhook(
             return
         except Exception as e:
             storage.update_forward_status(webhook_id, 0, f"Transform error: {e}")
-            await manager.broadcast({
+            await manager.broadcast(endpoint_id, {
                 "type": "forward_update",
                 "webhook_id": webhook_id,
                 "forward_status": 0,
@@ -892,10 +973,10 @@ async def _forward_webhook(
     for attempt in range(1, max_retries + 1):
         try:
             target = forward_url
-            resolved = _resolve_safe_url(target)
+            resolved = await _resolve_safe_url_async(target)
             if not resolved:
                 storage.update_forward_status(webhook_id, 0, "Forward URL blocked for security")
-                await manager.broadcast({
+                await manager.broadcast(endpoint_id, {
                     "type": "forward_update",
                     "webhook_id": webhook_id,
                     "forward_status": 0,
@@ -913,7 +994,7 @@ async def _forward_webhook(
                 async with session.request(method, pinned_url, headers=fwd_headers, data=fwd_body, allow_redirects=False) as resp:
                     resp_text = await _safe_resp_text(resp)
                     storage.update_forward_status(webhook_id, resp.status, resp_text[:2000])
-                    await manager.broadcast({
+                    await manager.broadcast(endpoint_id, {
                         "type": "forward_update",
                         "webhook_id": webhook_id,
                         "forward_status": resp.status,
@@ -925,7 +1006,7 @@ async def _forward_webhook(
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
                 continue
             storage.update_forward_status(webhook_id, 0, str(e)[:500])
-            await manager.broadcast({
+            await manager.broadcast(endpoint_id, {
                 "type": "forward_update",
                 "webhook_id": webhook_id,
                 "forward_status": 0,
@@ -1288,7 +1369,7 @@ async def replay_webhook(webhook_id: str, request: Request):
 
     if method not in _ALLOWED_METHODS:
         raise HTTPException(status_code=400, detail="Method not allowed for replay")
-    resolved = _resolve_safe_url(url)
+    resolved = await _resolve_safe_url_async(url)
     if not resolved:
         raise HTTPException(status_code=400, detail="Target URL not allowed")
     pinned_url, extra_headers = resolved
@@ -1322,6 +1403,8 @@ async def bulk_replay(request: Request):
     target_url = data.get("url")
     if not webhook_ids:
         raise HTTPException(status_code=400, detail="No webhook_ids provided")
+    if len(webhook_ids) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 webhooks per bulk replay")
 
     results = []
     replay_timeout = aiohttp.ClientTimeout(total=30)
@@ -1337,7 +1420,7 @@ async def bulk_replay(request: Request):
         if method not in _ALLOWED_METHODS:
             results.append({"webhook_id": wh_id, "status": "error", "error": "Method not allowed"})
             continue
-        resolved = _resolve_safe_url(url)
+        resolved = await _resolve_safe_url_async(url)
         if not resolved:
             results.append({"webhook_id": wh_id, "status": "error", "error": "Target URL not allowed"})
             continue
@@ -1379,7 +1462,7 @@ async def test_webhook(request: Request):
         raise HTTPException(status_code=400, detail="url is required")
     if method not in _ALLOWED_METHODS:
         raise HTTPException(status_code=400, detail="Method not allowed")
-    resolved = _resolve_safe_url(target_url)
+    resolved = await _resolve_safe_url_async(target_url)
     if not resolved:
         raise HTTPException(status_code=400, detail="Target URL not allowed")
     pinned_url, extra_headers = resolved
@@ -1485,7 +1568,26 @@ async def websocket_endpoint(websocket: WebSocket):
         if not cookie or not auth._verify_cookie_value(cookie):
             await websocket.close(code=1008, reason="Authentication required")
             return
-    await manager.connect(websocket)
+    # Wait for subscription message with endpoint_id
+    subscribed_endpoint: str | None = None
+    try:
+        data = await asyncio.wait_for(websocket.receive_text(), timeout=10.0)
+        msg = json.loads(data)
+        if msg.get("action") == "subscribe":
+            eid = msg.get("endpoint_id", "")
+            if _validate_endpoint_id(eid) and storage.get_endpoint(eid):
+                subscribed_endpoint = eid
+                await manager.connect(subscribed_endpoint, websocket)
+                await websocket.send_json({"type": "subscribed", "endpoint_id": eid})
+            else:
+                await websocket.close(code=1008, reason="Invalid endpoint")
+                return
+        else:
+            await websocket.close(code=1008, reason="Subscribe required")
+            return
+    except (asyncio.TimeoutError, json.JSONDecodeError):
+        await websocket.close(code=1008, reason="Subscribe required")
+        return
     try:
         while True:
             data = await websocket.receive_text()
@@ -1496,7 +1598,8 @@ async def websocket_endpoint(websocket: WebSocket):
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        if subscribed_endpoint:
+            manager.disconnect(subscribed_endpoint, websocket)
 
 
 # ---------------------------------------------------------------------------
@@ -1574,6 +1677,17 @@ async def checkout_success(session_id: str = None):
         sess = stripe.checkout.Session.retrieve(session_id)
         if sess.payment_status != "paid":
             return "<h1>Payment not completed</h1><p>If you believe this is an error, contact support.</p>"
+
+        # Verify expected amount, currency, and mode
+        EXPECTED_AMOUNT_CENTS = 1200
+        EXPECTED_CURRENCY = "usd"
+        EXPECTED_MODE = "payment"
+        if sess.mode != EXPECTED_MODE:
+            return "<h1>Invalid session mode</h1><p>Contact support.</p>"
+        if sess.currency != EXPECTED_CURRENCY:
+            return "<h1>Currency mismatch</h1><p>Contact support.</p>"
+        if getattr(sess, "amount_total", 0) != EXPECTED_AMOUNT_CENTS:
+            return "<h1>Amount mismatch</h1><p>Contact support.</p>"
 
         lic_key = lic_module.create_license(
             email=sess.customer_details.email if sess.customer_details else None,
