@@ -17,7 +17,11 @@ def _get_conn():
 
 def init_db():
     conn = _get_conn()
-    conn.execute("PRAGMA journal_mode = WAL")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+    except sqlite3.OperationalError:
+        pass  # WAL requires write access; proceed without it if read-only
     conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             key TEXT PRIMARY KEY,

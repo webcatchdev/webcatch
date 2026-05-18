@@ -20,6 +20,11 @@ def _get_conn() -> sqlite3.Connection:
 
 def init_db() -> None:
     conn = _get_conn()
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS webhooks (

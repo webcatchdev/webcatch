@@ -155,7 +155,11 @@ def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
 
 def _csv_safe(value: str) -> str:
     """Prefix dangerous CSV characters to prevent formula injection."""
-    if value and value[0] in {"=", "+", "-", "@", "\t", "\r"}:
+    if value is None:
+        return ""
+    value = str(value)
+    dangerous = value.lstrip(" \t\r\n")
+    if dangerous.startswith(("=", "+", "-", "@")):
         return "'" + value
     return value
 
@@ -190,6 +194,8 @@ def _resolve_safe_url(url: str) -> tuple[str, dict] | None:
     parsed = urlparse(url)
     if not parsed.hostname:
         return None
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
     try:
         ip = ipaddress.ip_address(parsed.hostname)
         if _ip_is_blocked(ip):
@@ -210,7 +216,8 @@ def _resolve_safe_url(url: str) -> tuple[str, dict] | None:
         if not safe_ips:
             return None
         # Pin to first safe IP, preserve Host header
-        pinned = f"{parsed.scheme}://{safe_ips[0]}:{parsed.port or 80}{parsed.path}"
+        default_port = 443 if parsed.scheme == "https" else 80
+        pinned = f"{parsed.scheme}://{safe_ips[0]}:{parsed.port or default_port}{parsed.path}"
         if parsed.query:
             pinned += f"?{parsed.query}"
         return pinned, {"Host": parsed.hostname}
@@ -327,11 +334,19 @@ async def security_headers(request: Request, call_next):
 async def body_size_limit(request: Request, call_next):
     """Reject requests with body larger than MAX_BODY_SIZE before reading."""
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_BODY_SIZE:
-        return JSONResponse(
-            content={"status": "payload_too_large", "message": f"Max body size is {MAX_BODY_SIZE} bytes"},
-            status_code=413,
-        )
+    if content_length:
+        try:
+            length = int(content_length)
+        except ValueError:
+            return JSONResponse(
+                content={"status": "bad_request", "message": "Invalid Content-Length header"},
+                status_code=400,
+            )
+        if length > MAX_BODY_SIZE:
+            return JSONResponse(
+                content={"status": "payload_too_large", "message": f"Max body size is {MAX_BODY_SIZE} bytes"},
+                status_code=413,
+            )
     return await call_next(request)
 
 
@@ -342,9 +357,6 @@ async def body_size_limit(request: Request, call_next):
 _AUTH_WHITELIST = {
     "/api/health",
     "/api/login",
-    "/api/logout",
-    "/api/checkout",
-    "/api/license/validate",
     "/success",
     "/stripe/webhook",
     "/ws",
@@ -892,7 +904,8 @@ async def _forward_webhook(
             pinned_url, extra_headers = resolved
             if query_params:
                 separator = "&" if "?" in pinned_url else "?"
-                pinned_url += separator + "&".join(f"{k}={v}" for k, v in query_params.items())
+                from urllib.parse import urlencode
+                pinned_url += separator + urlencode(query_params, doseq=True)
             fwd_headers = {k: v for k, v in headers.items() if k.lower() not in ["host", "content-length", "transfer-encoding", "connection"]}
             fwd_headers.update(extra_headers)
             fwd_body = body
@@ -906,6 +919,7 @@ async def _forward_webhook(
                         "forward_status": resp.status,
                         "forward_response": resp_text[:500],
                     })
+                    return  # stop retrying on success
         except Exception as e:
             if attempt < max_retries:
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
@@ -915,8 +929,9 @@ async def _forward_webhook(
                 "type": "forward_update",
                 "webhook_id": webhook_id,
                 "forward_status": 0,
+                "forward_error": str(e)[:200],
             })
-
+            return
 
 # ---------------------------------------------------------------------------
 # API: Export webhooks
@@ -1170,13 +1185,23 @@ async def set_endpoint_config(endpoint_id: str, request: Request):
     if not _validate_endpoint_id(endpoint_id):
         raise HTTPException(status_code=400, detail="Invalid endpoint ID")
     data = await request.json()
+    status_code = data.get("status_code", 200)
+    if not isinstance(status_code, int) or not (100 <= status_code <= 599):
+        raise HTTPException(status_code=400, detail="status_code must be an integer between 100 and 599")
+    retention_count = data.get("retention_count")
+    if retention_count is not None:
+        if not isinstance(retention_count, int) or retention_count < 0 or retention_count > 10000:
+            raise HTTPException(status_code=400, detail="retention_count must be an integer between 0 and 10000")
+    forward_url = data.get("forward_url")
+    if forward_url and not _is_safe_url(forward_url):
+        raise HTTPException(status_code=400, detail="forward_url is not a valid safe URL")
     storage.set_endpoint_config(
         endpoint_id=endpoint_id,
-        status_code=data.get("status_code", 200),
+        status_code=status_code,
         response_headers=data.get("response_headers", {}),
         response_body=data.get("response_body"),
-        forward_url=data.get("forward_url"),
-        retention_count=data.get("retention_count"),
+        forward_url=forward_url,
+        retention_count=retention_count,
         filter_rules=data.get("filter_rules"),
         transform_script=data.get("transform_script"),
     )
@@ -1538,7 +1563,7 @@ async def create_checkout():
         )
         return {"url": session.url}
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": "Checkout creation failed"}, status_code=500)
 
 
 @app.get("/success", response_class=HTMLResponse)
@@ -1570,7 +1595,8 @@ font-family: monospace; font-size: 1.1rem; color: #3fb950; margin: 20px auto; di
 <a href="/dashboard" class="btn">Open Webcatch</a>
 </body></html>"""
     except Exception as e:
-        return f"<h1>Error</h1><p>{str(e)}</p>"
+        import html as _html
+        return f"<h1>Error</h1><p>{_html.escape(str(e))}</p>"
 
 
 @app.post("/api/license/validate")
